@@ -178,12 +178,18 @@ EVENTS_UPDATE_TOOL = {
         "Update selected fields of an event. Omitted fields remain unchanged and an empty "
         "description, location, or attendee list clears that field. For an event with a timezone, "
         "change start and end together using local date-times without offsets; its TZID is "
-        "preserved. Requires explicit approval."
+        "preserved. For a recurring event, set scope to series; recurring time changes are not "
+        "supported. Requires explicit approval."
     ),
     "inputSchema": {
         "type": "object",
         "properties": {
             "event_ref": {"type": "string", "minLength": 1},
+            "scope": {
+                "type": "string",
+                "enum": ["series"],
+                "description": "Required when updating a recurring event's whole series.",
+            },
             "summary": _private_string_schema(allow_empty=False),
             "start": {"type": "string"},
             "end": {"type": "string"},
@@ -203,10 +209,20 @@ EVENTS_UPDATE_TOOL = {
 
 EVENTS_DELETE_TOOL = {
     "name": "events_delete",
-    "description": "Permanently delete an event. This always requires explicit user approval.",
+    "description": (
+        "Permanently delete an event. Set scope to series when deleting a recurring event's "
+        "whole series. This always requires explicit user approval."
+    ),
     "inputSchema": {
         "type": "object",
-        "properties": {"event_ref": {"type": "string", "minLength": 1}},
+        "properties": {
+            "event_ref": {"type": "string", "minLength": 1},
+            "scope": {
+                "type": "string",
+                "enum": ["series"],
+                "description": "Required when deleting a recurring event's whole series.",
+            },
+        },
         "required": ["event_ref"],
         "additionalProperties": False,
     },
@@ -736,15 +752,28 @@ class PrivateCalendarMCPServer:
         )
 
     def _handle_events_update(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
-        allowed = {"event_ref", "summary", "start", "end", "description", "location", "attendees"}
-        if "event_ref" not in arguments or len(arguments) == 1 or not set(arguments) <= allowed:
+        mutable_fields = {"summary", "start", "end", "description", "location", "attendees"}
+        allowed = {"event_ref", "scope", *mutable_fields}
+        if (
+            "event_ref" not in arguments
+            or not set(arguments) & mutable_fields
+            or not set(arguments) <= allowed
+        ):
             return self._error(
                 request_id, -32602, "events_update requires event_ref and at least one field"
             )
         try:
             resource = self._resolve(arguments["event_ref"], EventResource)
+            scope = arguments.get("scope")
+            if scope is not None and scope != "series":
+                raise ValueError("scope must be series")
             if resource.event.recurring:
-                raise ValueError("Recurring event updates are not supported in v1")
+                if scope != "series":
+                    raise ValueError("Recurring event updates require scope=series")
+                if "start" in arguments or "end" in arguments:
+                    raise ValueError("Recurring event time updates are not supported")
+            elif scope is not None:
+                raise ValueError("scope is only valid for recurring events")
             patch = _event_patch_from_arguments(arguments)
             apply_event_patch(resource.event, patch)
         except (TypeError, ValueError) as exc:
@@ -762,12 +791,24 @@ class PrivateCalendarMCPServer:
         )
 
     def _handle_events_delete(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
-        if set(arguments) != {"event_ref"}:
-            return self._error(request_id, -32602, "events_delete requires only event_ref")
+        if "event_ref" not in arguments or not set(arguments) <= {"event_ref", "scope"}:
+            return self._error(
+                request_id, -32602, "events_delete requires event_ref and optional scope"
+            )
         try:
             resource = self._resolve(arguments["event_ref"], EventResource)
         except (TypeError, ValueError) as exc:
             return self._error(request_id, -32001, str(exc))
+        try:
+            scope = arguments.get("scope")
+            if scope is not None and scope != "series":
+                raise ValueError("scope must be series")
+            if resource.event.recurring and scope != "series":
+                raise ValueError("Recurring event deletion requires scope=series")
+            if not resource.event.recurring and scope is not None:
+                raise ValueError("scope is only valid for recurring events")
+        except (TypeError, ValueError) as exc:
+            return self._error(request_id, -32602, str(exc))
         self._source.delete_event(resource)
         self._invalidate_resource(resource)
         return self._private_result(request_id, {"status": "deleted"}, {}, "Deleted the event.")
@@ -1008,23 +1049,33 @@ def patch_icalendar(payload: str, event: Event, *, patch: EventPatch) -> str:
         if selected
     }
     lines = _unfold_ical_lines(payload)
-    result: list[str] = []
-    in_event = False
-    inserted = False
-    for line in lines:
-        name = _property_name(line)
-        if name == "BEGIN" and _line_value(line).upper() == "VEVENT":
-            in_event = True
-        if in_event and name in replaced:
+    for start_index, line in enumerate(lines):
+        if _property_name(line) != "BEGIN" or _line_value(line).upper() != "VEVENT":
             continue
-        if in_event and name == "END" and _line_value(line).upper() == "VEVENT" and not inserted:
-            result.extend(_event_property_lines(event, properties=replaced))
-            inserted = True
-            in_event = False
-        result.append(line)
-    if not inserted:
-        raise RuntimeError("CalDAV returned an invalid iCalendar event")
-    return _serialize_ical_lines(result)
+        end_index = next(
+            (
+                index
+                for index in range(start_index + 1, len(lines))
+                if _property_name(lines[index]) == "END"
+                and _line_value(lines[index]).upper() == "VEVENT"
+            ),
+            None,
+        )
+        if end_index is None:
+            break
+        component = lines[start_index + 1 : end_index]
+        if _component_property(component, "RECURRENCE-ID") is not None:
+            continue
+        preserved = [line for line in component if _property_name(line) not in replaced]
+        return _serialize_ical_lines(
+            [
+                *lines[: start_index + 1],
+                *preserved,
+                *_event_property_lines(event, properties=replaced),
+                *lines[end_index:],
+            ]
+        )
+    raise RuntimeError("CalDAV returned an invalid iCalendar event")
 
 
 def apply_event_patch(event: Event, patch: EventPatch) -> Event:

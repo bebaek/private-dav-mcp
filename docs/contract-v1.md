@@ -80,6 +80,8 @@ The CalDAV server exposes exactly these v1 tools:
 `events_list` requires a bounded date-time range no longer than 366 days and protects summaries.
 `events_get` returns only selected description, location, and attendee fields. Updating the time of
 a `TZID` event requires both local start and end values and preserves its timezone definition.
+Recurring non-temporal updates and deletion require `scope: "series"`; recurring time changes are
+rejected so recurrence exceptions cannot be shifted incorrectly.
 
 ## Mutation policy
 

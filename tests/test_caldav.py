@@ -200,6 +200,42 @@ def test_serialize_and_patch_icalendar_preserve_unknown_and_recurring_properties
     assert "X-CUSTOM:keep\r\n" in patched
 
 
+def test_patch_recurring_master_preserves_exception_components() -> None:
+    original = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "BEGIN:VEVENT",
+            "UID:event-id",
+            "DTSTART:20260301T090000Z",
+            "DTEND:20260301T100000Z",
+            "RRULE:FREQ=WEEKLY",
+            "SUMMARY:Planning",
+            "END:VEVENT",
+            "BEGIN:VEVENT",
+            "UID:event-id",
+            "RECURRENCE-ID:20260308T090000Z",
+            "DTSTART:20260308T110000Z",
+            "DTEND:20260308T120000Z",
+            "SUMMARY:Exception title",
+            "X-EXCEPTION:preserve",
+            "END:VEVENT",
+            "END:VCALENDAR",
+            "",
+        ]
+    )
+    event = parse_icalendar(original)
+    assert event is not None and event.recurring is True
+    patch = EventPatch(summary="Updated series")
+
+    payload = patch_icalendar(original, apply_event_patch(event, patch), patch=patch)
+
+    assert payload.count("SUMMARY:Updated series\r\n") == 1
+    assert "RRULE:FREQ=WEEKLY\r\n" in payload
+    assert "RECURRENCE-ID:20260308T090000Z\r\n" in payload
+    assert "SUMMARY:Exception title\r\n" in payload
+    assert "X-EXCEPTION:preserve\r\n" in payload
+
+
 def test_patch_timezone_event_times_preserves_tzid_and_timezone_component() -> None:
     original = "\r\n".join(
         [
@@ -434,7 +470,7 @@ def test_private_calendar_mcp_updates_tzid_event_with_local_times() -> None:
     assert event["timezone"] == "America/New_York"
 
 
-def test_private_calendar_mcp_rejects_unbounded_queries_and_recurring_updates() -> None:
+def test_private_calendar_mcp_enforces_query_and_recurring_series_scope() -> None:
     references = iter(("calendar-ref", "event-ref"))
     server = PrivateCalendarMCPServer(
         events=[
@@ -503,7 +539,51 @@ def test_private_calendar_mcp_rejects_unbounded_queries_and_recurring_updates() 
     )
     assert response is not None
     assert response["error"]["code"] == -32602
-    assert "Recurring" in response["error"]["message"]
+    assert "scope=series" in response["error"]["message"]
+
+    temporal_response = server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "events_update",
+                "arguments": {
+                    "event_ref": "event-ref",
+                    "scope": "series",
+                    "start": "2026-03-01T11:00:00Z",
+                    "end": "2026-03-01T12:00:00Z",
+                },
+            },
+        }
+    )
+    assert temporal_response is not None
+    assert "time updates are not supported" in temporal_response["error"]["message"]
+
+    updated = _call(
+        server,
+        "events_update",
+        {"event_ref": "event-ref", "scope": "series", "summary": "Changed"},
+    )
+    assert updated["structuredContent"]["status"] == "updated"
+
+    delete_without_scope = server.handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "events_delete", "arguments": {"event_ref": "event-ref"}},
+        }
+    )
+    assert delete_without_scope is not None
+    assert "scope=series" in delete_without_scope["error"]["message"]
+
+    deleted = _call(
+        server,
+        "events_delete",
+        {"event_ref": "event-ref", "scope": "series"},
+    )
+    assert deleted["structuredContent"] == {"status": "deleted"}
 
 
 def _call(server: PrivateCalendarMCPServer, name: str, arguments: dict[str, object]) -> dict:
