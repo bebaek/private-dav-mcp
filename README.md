@@ -22,6 +22,29 @@ uv run basedpyright
 uv run pytest
 ```
 
+## Compatibility contract
+
+The versioned Minigent integration contract is documented in
+[`docs/contract-v1.md`](docs/contract-v1.md). CI builds the production image, starts both server
+processes, and runs the black-box suite in `tests/test_container_contract.py` against their HTTP
+endpoints.
+
+To run that suite locally:
+
+```bash
+docker build -t private-dav-mcp:contract .
+docker run --rm -d --name private-dav-carddav-contract -p 18767:8767 \
+  private-dav-mcp:contract private-dav-carddav-mcp --host 0.0.0.0 --port 8767
+docker run --rm -d --name private-dav-caldav-contract -p 18768:8768 \
+  private-dav-mcp:contract private-dav-caldav-mcp --host 0.0.0.0 --port 8768
+PRIVATE_DAV_CARDDAV_CONTRACT_URL=http://127.0.0.1:18767/mcp \
+PRIVATE_DAV_CALDAV_CONTRACT_URL=http://127.0.0.1:18768/mcp \
+  uv run pytest tests/test_container_contract.py
+```
+
+The default in-memory sources are intentionally used for these contract checks; no DAV credentials
+or network service are required. Stop both containers when finished.
+
 ## CardDAV
 
 ```bash

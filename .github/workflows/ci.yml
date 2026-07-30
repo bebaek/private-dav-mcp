@@ -44,11 +44,75 @@ jobs:
       - name: Run tests
         run: uv run --no-sync pytest
 
+  container-contract:
+    name: Production container contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [quality]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.29"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install test dependencies
+        run: uv sync --locked --dev
+      - name: Build production image
+        run: docker build --tag private-dav-mcp:contract .
+      - name: Start CardDAV and CalDAV servers
+        run: |
+          docker run --detach --name private-dav-carddav-contract --publish 18767:8767 \
+            private-dav-mcp:contract \
+            private-dav-carddav-mcp --host 0.0.0.0 --port 8767
+          docker run --detach --name private-dav-caldav-contract --publish 18768:8768 \
+            private-dav-mcp:contract \
+            private-dav-caldav-mcp --host 0.0.0.0 --port 8768
+      - name: Wait for MCP endpoints
+        run: |
+          for port in 18767 18768; do
+            ready=false
+            for attempt in $(seq 1 30); do
+              if curl --fail --silent --show-error \
+                --header 'Content-Type: application/json' \
+                --data '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
+                "http://127.0.0.1:${port}/mcp" >/dev/null; then
+                ready=true
+                break
+              fi
+              sleep 1
+            done
+            if [ "$ready" != true ]; then
+              docker logs private-dav-carddav-contract || true
+              docker logs private-dav-caldav-contract || true
+              exit 1
+            fi
+          done
+      - name: Run black-box contract tests
+        env:
+          PRIVATE_DAV_CARDDAV_CONTRACT_URL: http://127.0.0.1:18767/mcp
+          PRIVATE_DAV_CALDAV_CONTRACT_URL: http://127.0.0.1:18768/mcp
+        run: uv run --no-sync pytest tests/test_container_contract.py
+      - name: Show container logs
+        if: failure()
+        run: |
+          docker logs private-dav-carddav-contract || true
+          docker logs private-dav-caldav-contract || true
+      - name: Stop containers
+        if: always()
+        run: docker rm --force private-dav-carddav-contract private-dav-caldav-contract || true
+
   production-image:
     name: Build and publish production image
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [quality]
+    needs: [container-contract]
     permissions:
       contents: read
       packages: write
