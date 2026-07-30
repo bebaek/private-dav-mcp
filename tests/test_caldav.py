@@ -15,6 +15,7 @@ from private_dav_mcp.caldav import (
     discover_caldav_home_urls,
     parse_caldav_calendars,
     parse_caldav_event_resources,
+    parse_caldav_expanded_events,
     parse_icalendar,
     patch_icalendar,
     serialize_icalendar,
@@ -173,6 +174,41 @@ END:VCALENDAR
     assert resource.raw_icalendar is not None and "X-CUSTOM:preserve me" in resource.raw_icalendar
 
 
+def test_parse_caldav_expanded_events_returns_each_recurrence_instance() -> None:
+    events = parse_caldav_expanded_events(
+        b"""<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+<d:response><d:href>/calendars/personal/series.ics</d:href><d:propstat><d:prop>
+<cal:calendar-data><![CDATA[
+BEGIN:VCALENDAR
+BEGIN:VEVENT
+UID:series
+RECURRENCE-ID:20260301T090000Z
+DTSTART:20260301T090000Z
+DTEND:20260301T100000Z
+SUMMARY:Private one
+END:VEVENT
+BEGIN:VEVENT
+UID:series
+RECURRENCE-ID:20260308T090000Z
+DTSTART:20260308T110000Z
+DTEND:20260308T120000Z
+SUMMARY:Private two
+TRANSP:TRANSPARENT
+STATUS:CANCELLED
+END:VEVENT
+END:VCALENDAR
+]]></cal:calendar-data></d:prop></d:propstat></d:response></d:multistatus>""",
+        calendar_url="https://dav.example/calendars/personal/",
+    )
+
+    assert [(event.start, event.end) for event in events] == [
+        ("2026-03-01T09:00:00Z", "2026-03-01T10:00:00Z"),
+        ("2026-03-08T11:00:00Z", "2026-03-08T12:00:00Z"),
+    ]
+    assert events[0].transparent is False and events[0].cancelled is False
+    assert events[1].transparent is True and events[1].cancelled is True
+
+
 def test_serialize_and_patch_icalendar_preserve_unknown_and_recurring_properties() -> None:
     event = Event(
         summary="Planning",
@@ -307,6 +343,15 @@ def test_caldav_source_uses_bounded_report_and_etag_writes() -> None:
     assert b' start="20260301T000000Z" end="20260302T000000Z"' in report.content
     assert b"calendar-query" in report.content
 
+    busy_events, busy_truncated = source.list_busy_events(
+        calendars[0], start=start, end=end, limit=10
+    )
+    expanded_report = requests[-1]
+    assert busy_truncated is False
+    assert busy_events[0].summary == "Planning"
+    assert b"<cal:expand" in expanded_report.content
+    assert b' start="20260301T000000Z" end="20260302T000000Z"' in expanded_report.content
+
     created = source.create_event(
         calendars[0],
         Event("Created", "2026-03-01T09:00:00Z", "2026-03-01T10:00:00Z"),
@@ -417,6 +462,55 @@ def test_private_calendar_mcp_protects_reads_and_supports_crud() -> None:
 
     deleted = _call(server, "events_delete", {"event_ref": "created-ref"})
     assert deleted["structuredContent"] == {"status": "deleted"}
+
+
+def test_private_calendar_mcp_free_busy_merges_intervals_without_private_fields() -> None:
+    server = PrivateCalendarMCPServer(
+        events=[
+            Event("Private one", "2026-03-01T09:00:00Z", "2026-03-01T10:00:00Z"),
+            Event("Private two", "2026-03-01T09:30:00Z", "2026-03-01T11:00:00Z"),
+            Event(
+                "Private timezone title",
+                "2026-03-01T12:00:00",
+                "2026-03-01T13:00:00",
+                timezone="America/New_York",
+            ),
+            Event(
+                "Private transparent",
+                "2026-03-01T10:30:00Z",
+                "2026-03-01T14:00:00Z",
+                transparent=True,
+            ),
+            Event(
+                "Private cancelled",
+                "2026-03-01T18:00:00Z",
+                "2026-03-01T19:00:00Z",
+                cancelled=True,
+            ),
+        ],
+        reference_factory=lambda: "calendar-ref",
+    )
+    _call(server, "calendars_list", {})
+
+    result = _call(
+        server,
+        "free_busy",
+        {
+            "calendar_ref": "calendar-ref",
+            "start": "2026-03-01T00:00:00Z",
+            "end": "2026-03-02T00:00:00Z",
+        },
+    )
+
+    assert result["structuredContent"] == {
+        "busy": [
+            {"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T11:00:00Z"},
+            {"start": "2026-03-01T17:00:00Z", "end": "2026-03-01T18:00:00Z"},
+        ],
+        "truncated": False,
+    }
+    assert result["_meta"][PRIVATE_VALUES_META_KEY] == {}
+    assert "Private" not in str(result)
 
 
 def test_private_calendar_mcp_updates_tzid_event_with_local_times() -> None:

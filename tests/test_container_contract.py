@@ -192,6 +192,7 @@ def test_caldav_container_contract(caldav: MCPContractClient) -> None:
             "calendars_list",
             "events_list",
             "events_get",
+            "free_busy",
             "events_create",
             "events_update",
             "events_delete",
@@ -244,6 +245,21 @@ def test_caldav_container_contract(caldav: MCPContractClient) -> None:
         "Contract room",
         "attendee@example.test",
     }
+
+    free_busy = caldav.call_tool(
+        "free_busy",
+        {
+            "calendar_ref": calendar["calendar_ref"],
+            "start": "2026-03-01T00:00:00Z",
+            "end": "2026-03-02T00:00:00Z",
+        },
+    )
+    _assert_private_result(free_busy)
+    assert free_busy["structuredContent"] == {
+        "busy": [{"start": "2026-03-01T09:00:00Z", "end": "2026-03-01T10:00:00Z"}],
+        "truncated": False,
+    }
+    assert "Contract planning" not in str(free_busy)
 
     updated = caldav.call_tool(
         "events_update", {"event_ref": event["event_ref"], "summary": "Updated contract"}

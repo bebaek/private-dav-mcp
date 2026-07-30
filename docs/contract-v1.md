@@ -73,15 +73,17 @@ The CalDAV server exposes exactly these v1 tools:
 - `calendars_list`
 - `events_list`
 - `events_get`
+- `free_busy`
 - `events_create`
 - `events_update`
 - `events_delete`
 
 `events_list` requires a bounded date-time range no longer than 366 days and protects summaries.
-`events_get` returns only selected description, location, and attendee fields. Updating the time of
-a `TZID` event requires both local start and end values and preserves its timezone definition.
-Recurring non-temporal updates and deletion require `scope: "series"`; recurring time changes are
-rejected so recurrence exceptions cannot be shifted incorrectly.
+`events_get` returns only selected description, location, and attendee fields. `free_busy` uses a
+bounded CalDAV expansion query and returns merged UTC intervals without event titles or private
+metadata. Updating the time of a `TZID` event requires both local start and end values and preserves
+its timezone definition. Recurring non-temporal updates and deletion require `scope: "series"`;
+recurring time changes are rejected so recurrence exceptions cannot be shifted incorrectly.
 
 ## Mutation policy
 

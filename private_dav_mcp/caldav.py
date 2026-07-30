@@ -33,6 +33,8 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8768
 DEFAULT_EVENT_LIMIT = 25
 MAX_EVENT_LIMIT = 100
+DEFAULT_FREE_BUSY_LIMIT = 100
+MAX_FREE_BUSY_LIMIT = 500
 MAX_EVENT_QUERY_DAYS = 366
 DEFAULT_REFERENCE_TTL_SECONDS = 1800.0
 MAX_REFERENCES = 1000
@@ -67,12 +69,18 @@ CALDAV_HOME_PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8" ?>
 """
 
 
-def _calendar_query_body(start: datetime, end: datetime) -> bytes:
+def _calendar_query_body(start: datetime, end: datetime, *, expand: bool = False) -> bytes:
     start_value = start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     end_value = end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    calendar_data = (
+        f'<cal:calendar-data><cal:expand start="{start_value}" end="{end_value}" />'
+        "</cal:calendar-data>"
+        if expand
+        else "<cal:calendar-data />"
+    )
     return f"""<?xml version="1.0" encoding="utf-8" ?>
 <cal:calendar-query xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
-  <d:prop><d:getetag /><cal:calendar-data /></d:prop>
+  <d:prop><d:getetag />{calendar_data}</d:prop>
   <cal:filter>
     <cal:comp-filter name="VCALENDAR">
       <cal:comp-filter name="VEVENT">
@@ -133,6 +141,50 @@ EVENTS_GET_TOOL = {
             },
         },
         "required": ["event_ref", "fields"],
+        "additionalProperties": False,
+    },
+}
+
+
+FREE_BUSY_TOOL = {
+    "name": "free_busy",
+    "description": (
+        "Return merged UTC busy intervals for one calendar over a required bounded range. "
+        "Event titles and other private fields are never returned."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "calendar_ref": {"type": "string", "minLength": 1},
+            "start": {"type": "string", "format": "date-time"},
+            "end": {"type": "string", "format": "date-time"},
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_FREE_BUSY_LIMIT,
+            },
+        },
+        "required": ["calendar_ref", "start", "end"],
+        "additionalProperties": False,
+    },
+    "outputSchema": {
+        "type": "object",
+        "properties": {
+            "busy": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "start": {"type": "string", "format": "date-time"},
+                        "end": {"type": "string", "format": "date-time"},
+                    },
+                    "required": ["start", "end"],
+                    "additionalProperties": False,
+                },
+            },
+            "truncated": {"type": "boolean"},
+        },
+        "required": ["busy", "truncated"],
         "additionalProperties": False,
     },
 }
@@ -247,6 +299,8 @@ class Event:
     all_day: bool = False
     timezone: str | None = None
     recurring: bool = False
+    transparent: bool = False
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -281,6 +335,10 @@ class CalendarSource(Protocol):
     def list_event_resources(
         self, calendar: Calendar, *, start: datetime, end: datetime, limit: int
     ) -> tuple[list[EventResource], bool]: ...
+
+    def list_busy_events(
+        self, calendar: Calendar, *, start: datetime, end: datetime, limit: int
+    ) -> tuple[list[Event], bool]: ...
 
     def create_event(self, calendar: Calendar, event: Event) -> EventResource: ...
 
@@ -326,6 +384,28 @@ class StaticCalendarSource:
         ]
         resources.sort(key=lambda resource: resource.event.start)
         return resources[:limit], len(resources) > limit
+
+    def list_busy_events(
+        self, calendar: Calendar, *, start: datetime, end: datetime, limit: int
+    ) -> tuple[list[Event], bool]:
+        events = [
+            resource.event
+            for resource in self._resources
+            if resource.calendar_href == calendar.href
+            and _event_overlaps(resource.event, start=start, end=end)
+            and not resource.event.transparent
+            and not resource.event.cancelled
+        ]
+        events.sort(
+            key=lambda event: (
+                _event_datetime(event.start, timezone_name=event.timezone, field="start")
+                if not event.all_day
+                else datetime.combine(
+                    date.fromisoformat(event.start), datetime.min.time(), timezone.utc
+                )
+            )
+        )
+        return events[:limit], len(events) > limit
 
     def create_event(self, calendar: Calendar, event: Event) -> EventResource:
         uid = str(uuid4())
@@ -429,6 +509,28 @@ class CalDAVCalendarSource:
         self._http.check_response_size(response.content)
         resources = parse_caldav_event_resources(response.content, calendar_url=calendar.href)
         return resources[:limit], len(resources) > limit
+
+    def list_busy_events(
+        self, calendar: Calendar, *, start: datetime, end: datetime, limit: int
+    ) -> tuple[list[Event], bool]:
+        with self._http.client() as client:
+            _response, auth, home_url = self._discover(client)
+            _validate_collection_url(calendar.href, base_url=home_url)
+            response = self._http.request(
+                client,
+                "REPORT",
+                calendar.href,
+                auth=auth,
+                headers=xml_headers(),
+                content=_calendar_query_body(start, end, expand=True),
+            )
+        self._http.check_response_size(response.content)
+        events = [
+            event
+            for event in parse_caldav_expanded_events(response.content, calendar_url=calendar.href)
+            if not event.transparent and not event.cancelled
+        ]
+        return events[:limit], len(events) > limit
 
     def create_event(self, calendar: Calendar, event: Event) -> EventResource:
         uid = str(uuid4())
@@ -587,6 +689,7 @@ class PrivateCalendarMCPServer:
                         CALENDARS_LIST_TOOL,
                         EVENTS_LIST_TOOL,
                         EVENTS_GET_TOOL,
+                        FREE_BUSY_TOOL,
                         EVENTS_CREATE_TOOL,
                         EVENTS_UPDATE_TOOL,
                         EVENTS_DELETE_TOOL,
@@ -610,6 +713,7 @@ class PrivateCalendarMCPServer:
             "calendars_list": self._handle_calendars_list,
             "events_list": self._handle_events_list,
             "events_get": self._handle_events_get,
+            "free_busy": self._handle_free_busy,
             "events_create": self._handle_events_create,
             "events_update": self._handle_events_update,
             "events_delete": self._handle_events_delete,
@@ -721,6 +825,38 @@ class PrivateCalendarMCPServer:
                 content[field] = self._protect(field, value, private_values) if value else ""
         return self._private_result(
             request_id, content, private_values, "Retrieved selected protected event fields."
+        )
+
+    def _handle_free_busy(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not {"calendar_ref", "start", "end"} <= set(arguments) or not set(arguments) <= {
+            "calendar_ref",
+            "start",
+            "end",
+            "limit",
+        }:
+            return self._error(
+                request_id, -32602, "free_busy requires calendar_ref, start, and end"
+            )
+        try:
+            calendar = self._resolve(arguments["calendar_ref"], Calendar)
+            start = _parse_query_datetime(arguments["start"], field="start")
+            end = _parse_query_datetime(arguments["end"], field="end")
+            limit = _validate_free_busy_limit(arguments.get("limit", DEFAULT_FREE_BUSY_LIMIT))
+            if end <= start:
+                raise ValueError("end must be after start")
+            if (end - start).total_seconds() > MAX_EVENT_QUERY_DAYS * 86_400:
+                raise ValueError(f"free/busy range must not exceed {MAX_EVENT_QUERY_DAYS} days")
+        except (TypeError, ValueError) as exc:
+            return self._error(request_id, -32602, str(exc))
+        events, truncated = self._source.list_busy_events(
+            calendar, start=start, end=end, limit=limit
+        )
+        busy = _merge_busy_intervals(events, range_start=start, range_end=end)
+        return self._private_result(
+            request_id,
+            {"busy": busy, "truncated": truncated},
+            {},
+            f"Found {len(busy)} busy intervals.",
         )
 
     def _handle_events_create(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -976,14 +1112,45 @@ def parse_caldav_event_resources(payload: bytes, *, calendar_url: str) -> list[E
     return resources
 
 
+def parse_caldav_expanded_events(payload: bytes, *, calendar_url: str) -> list[Event]:
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError as exc:
+        raise RuntimeError("CalDAV server returned invalid XML") from exc
+    events: list[Event] = []
+    for response in root.iter(f"{{{DAV_NAMESPACE}}}response"):
+        href_element = response.find(f"{{{DAV_NAMESPACE}}}href")
+        if href_element is None or not href_element.text:
+            continue
+        href = urljoin(calendar_url, href_element.text.strip())
+        _validate_resource_url(href, calendar_url=calendar_url)
+        data = next(response.iter(f"{{{CALDAV_NAMESPACE}}}calendar-data"), None)
+        if data is not None and data.text:
+            events.extend(parse_icalendar_instances(data.text))
+    return events
+
+
 def parse_icalendar(payload: str) -> Event | None:
-    components = _vevent_components(payload)
     component = next(
-        (item for item in components if _component_property(item, "RECURRENCE-ID") is None),
+        (
+            item
+            for item in _vevent_components(payload)
+            if _component_property(item, "RECURRENCE-ID") is None
+        ),
         None,
     )
-    if component is None:
-        return None
+    return _event_from_ical_component(component) if component is not None else None
+
+
+def parse_icalendar_instances(payload: str) -> list[Event]:
+    return [
+        event
+        for component in _vevent_components(payload)
+        if (event := _event_from_ical_component(component)) is not None
+    ]
+
+
+def _event_from_ical_component(component: Sequence[str]) -> Event | None:
     start_line = _component_property(component, "DTSTART")
     end_line = _component_property(component, "DTEND")
     if start_line is None or end_line is None:
@@ -1014,6 +1181,12 @@ def parse_icalendar(payload: str) -> Event | None:
         all_day=all_day,
         timezone=timezone_name or end_timezone,
         recurring=_component_property(component, "RRULE") is not None,
+        transparent=(
+            _line_value(_component_property(component, "TRANSP") or "").upper() == "TRANSPARENT"
+        ),
+        cancelled=(
+            _line_value(_component_property(component, "STATUS") or "").upper() == "CANCELLED"
+        ),
     )
 
 
@@ -1090,6 +1263,8 @@ def apply_event_patch(event: Event, patch: EventPatch) -> Event:
         location=event.location if patch.location is None else patch.location,
         attendees=event.attendees if patch.attendees is None else patch.attendees,
         recurring=event.recurring,
+        transparent=event.transparent,
+        cancelled=event.cancelled,
     )
     start_kind = _event_temporal_kind(updated.start, timezone_name=updated_timezone, field="start")
     end_kind = _event_temporal_kind(updated.end, timezone_name=updated_timezone, field="end")
@@ -1259,17 +1434,57 @@ def _validate_limit(value: Any) -> int:
     return value
 
 
-def _event_overlaps(event: Event, *, start: datetime, end: datetime) -> bool:
+def _validate_free_busy_limit(value: Any) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= MAX_FREE_BUSY_LIMIT
+    ):
+        raise ValueError(f"limit must be an integer from 1 to {MAX_FREE_BUSY_LIMIT}")
+    return value
+
+
+def _event_bounds_utc(event: Event) -> tuple[datetime, datetime]:
     if event.all_day:
-        event_start = datetime.combine(
-            date.fromisoformat(event.start), datetime.min.time(), timezone.utc
-        )
-        event_end = datetime.combine(
-            date.fromisoformat(event.end), datetime.min.time(), timezone.utc
-        )
+        start = datetime.combine(date.fromisoformat(event.start), datetime.min.time(), timezone.utc)
+        end = datetime.combine(date.fromisoformat(event.end), datetime.min.time(), timezone.utc)
     else:
-        event_start = _event_datetime(event.start, timezone_name=event.timezone, field="start")
-        event_end = _event_datetime(event.end, timezone_name=event.timezone, field="end")
+        start = _event_datetime(event.start, timezone_name=event.timezone, field="start")
+        end = _event_datetime(event.end, timezone_name=event.timezone, field="end")
+    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+
+
+def _merge_busy_intervals(
+    events: Sequence[Event], *, range_start: datetime, range_end: datetime
+) -> list[dict[str, str]]:
+    intervals = []
+    for event in events:
+        if event.transparent or event.cancelled:
+            continue
+        start, end = _event_bounds_utc(event)
+        start = max(start, range_start.astimezone(timezone.utc))
+        end = min(end, range_end.astimezone(timezone.utc))
+        if start < end:
+            intervals.append((start, end))
+    intervals.sort()
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return [
+        {"start": _utc_datetime_string(start), "end": _utc_datetime_string(end)}
+        for start, end in merged
+    ]
+
+
+def _utc_datetime_string(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _event_overlaps(event: Event, *, start: datetime, end: datetime) -> bool:
+    event_start, event_end = _event_bounds_utc(event)
     return event_start < end and event_end > start
 
 
