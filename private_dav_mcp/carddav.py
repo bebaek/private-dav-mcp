@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import json
 import os
 import re
 import secrets
@@ -16,9 +14,11 @@ from uuid import uuid4
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 
+from private_dav_mcp.mcp_http import create_mcp_app
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
+from private_dav_mcp.webdav import DAVHTTPClient, url_origin, validate_http_url, xml_headers
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
@@ -34,7 +34,6 @@ CARDDAV_URL_ENV = "MINIGENT_CARDDAV_URL"
 CARDDAV_USERNAME_ENV = "MINIGENT_CARDDAV_USERNAME"
 CARDDAV_PASSWORD_ENV = "MINIGENT_CARDDAV_PASSWORD"
 CARDDAV_AUTH_MODE_ENV = "MINIGENT_CARDDAV_AUTH_MODE"
-CARDDAV_AUTH_MODES = {"auto", "basic", "digest"}
 CARDDAV_NAMESPACE = "urn:ietf:params:xml:ns:carddav"
 DAV_NAMESPACE = "DAV:"
 _PARTIAL_CONTACT_ALIAS_PREFIX_PATTERN = re.compile(
@@ -347,41 +346,38 @@ class CardDAVContactSource:
     ) -> None:
         if not addressbook_url.strip():
             raise ValueError("CardDAV address-book URL is required")
-        parsed_addressbook_url = urlsplit(addressbook_url)
-        if (
-            parsed_addressbook_url.scheme not in {"http", "https"}
-            or not parsed_addressbook_url.hostname
-        ):
-            raise ValueError("CardDAV address-book URL must use HTTP or HTTPS")
-        if parsed_addressbook_url.username or parsed_addressbook_url.password:
-            raise ValueError("CardDAV credentials must not be embedded in the address-book URL")
+        validate_http_url(addressbook_url, label="CardDAV address-book URL")
         if not username:
             raise ValueError("CardDAV username is required")
         if not password:
             raise ValueError("CardDAV password is required")
-        normalized_auth_mode = auth_mode.strip().lower()
-        if normalized_auth_mode not in CARDDAV_AUTH_MODES:
-            raise ValueError("CardDAV auth mode must be auto, basic, or digest")
         self._addressbook_url = addressbook_url
-        self._username = username
-        self._password = password
-        self._auth_mode = normalized_auth_mode
-        self._verify_tls = verify_tls
-        self._timeout_seconds = timeout_seconds
-        self._transport = transport
+        self._http = DAVHTTPClient(
+            protocol_name="CardDAV",
+            username=username,
+            password=password,
+            auth_mode=auth_mode,
+            verify_tls=verify_tls,
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=MAX_CARDDAV_RESPONSE_BYTES,
+            response_size_message="CardDAV response exceeded the private contacts size limit",
+            changed_message="CardDAV contact changed; list it again before retrying",
+            not_found_message="CardDAV contact no longer exists",
+            transport=transport,
+        )
 
     def list_contact_resources(self, *, limit: int) -> tuple[list[ContactResource], bool]:
-        with self._client() as client:
+        with self._http.client() as client:
             addressbook_url, auth = self._discover_addressbook(client)
-            response = self._request(
+            response = self._http.request(
                 client,
                 "REPORT",
                 addressbook_url,
                 auth=auth,
-                headers=self._xml_headers(),
+                headers=xml_headers(),
                 content=CARDDAV_REPORT_BODY,
             )
-        self._check_response_size(response.content)
+        self._http.check_response_size(response.content)
         resources = parse_carddav_multistatus_resources(
             response.content,
             addressbook_url=addressbook_url,
@@ -395,11 +391,11 @@ class CardDAVContactSource:
     def create_contact(self, contact: Contact) -> ContactResource:
         uid = str(uuid4())
         payload = serialize_vcard(contact, uid=uid)
-        with self._client() as client:
+        with self._http.client() as client:
             addressbook_url, auth = self._discover_addressbook(client)
             href = f"{addressbook_url.rstrip('/')}/{quote(uid, safe='')}.vcf"
             _validate_resource_url(href, addressbook_url=addressbook_url)
-            response = self._request(
+            response = self._http.request(
                 client,
                 "PUT",
                 href,
@@ -432,10 +428,10 @@ class CardDAVContactSource:
             "Content-Type": "text/vcard; charset=utf-8",
             "If-Match": resource.etag,
         }
-        with self._client() as client:
+        with self._http.client() as client:
             addressbook_url, auth = self._discover_addressbook(client)
             _validate_resource_url(href, addressbook_url=addressbook_url)
-            response = self._request(
+            response = self._http.request(
                 client,
                 "PUT",
                 href,
@@ -456,112 +452,31 @@ class CardDAVContactSource:
         if not resource.etag:
             raise RuntimeError("Contact has no ETag; list it again before deleting")
         headers = {"If-Match": resource.etag}
-        with self._client() as client:
+        with self._http.client() as client:
             addressbook_url, auth = self._discover_addressbook(client)
             _validate_resource_url(href, addressbook_url=addressbook_url)
-            self._request(client, "DELETE", href, auth=auth, headers=headers)
-
-    def _client(self) -> httpx.Client:
-        return httpx.Client(
-            verify=self._verify_tls,
-            timeout=self._timeout_seconds,
-            transport=self._transport,
-        )
+            self._http.request(client, "DELETE", href, auth=auth, headers=headers)
 
     def _discover_addressbook(self, client: httpx.Client) -> tuple[str, httpx.Auth | None]:
-        auth = self._configured_auth()
-        response = client.request(
+        response, auth = self._http.request_with_auth_negotiation(
+            client,
             "PROPFIND",
             self._addressbook_url,
-            headers=self._xml_headers(),
+            headers=xml_headers(),
             content=CARDDAV_PROPFIND_BODY,
-            auth=auth,
+            operation="address-book discovery",
         )
-        if self._auth_mode == "auto" and response.status_code == 401:
-            auth = self._auth_from_challenge(response.headers.get("www-authenticate", ""))
-            response = client.request(
-                "PROPFIND",
-                self._addressbook_url,
-                headers=self._xml_headers(),
-                content=CARDDAV_PROPFIND_BODY,
-                auth=auth,
-            )
-        self._raise_for_status(response, operation="address-book discovery")
-        self._check_response_size(response.content)
+        self._http.check_response_size(response.content)
         return (
             discover_carddav_addressbook_url(response.content, base_url=self._addressbook_url),
             auth,
         )
-
-    def _request(
-        self,
-        client: httpx.Client,
-        method: str,
-        url: str,
-        *,
-        auth: httpx.Auth | None,
-        headers: dict[str, str],
-        content: bytes | None = None,
-    ) -> httpx.Response:
-        try:
-            response = client.request(
-                method,
-                url,
-                auth=auth,
-                headers=headers,
-                content=content,
-            )
-        except httpx.HTTPError as exc:
-            raise RuntimeError("CardDAV request failed") from exc
-        self._raise_for_status(response, operation=method.lower())
-        return response
-
-    @staticmethod
-    def _raise_for_status(response: httpx.Response, *, operation: str) -> None:
-        if response.status_code == 412:
-            raise RuntimeError("CardDAV contact changed; list it again before retrying")
-        if response.status_code == 404:
-            raise RuntimeError("CardDAV contact no longer exists")
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RuntimeError(
-                f"CardDAV {operation} failed with HTTP {response.status_code}"
-            ) from exc
-
-    @staticmethod
-    def _xml_headers() -> dict[str, str]:
-        return {
-            "Depth": "1",
-            "Content-Type": "application/xml; charset=utf-8",
-            "Accept": "application/xml",
-        }
-
-    @staticmethod
-    def _check_response_size(content: bytes) -> None:
-        if len(content) > MAX_CARDDAV_RESPONSE_BYTES:
-            raise RuntimeError("CardDAV response exceeded the private contacts size limit")
 
     @staticmethod
     def _writable_href(resource: ContactResource) -> str:
         if not resource.href:
             raise RuntimeError("Contact has no writable CardDAV resource")
         return resource.href
-
-    def _configured_auth(self) -> httpx.Auth | None:
-        if self._auth_mode == "basic":
-            return httpx.BasicAuth(self._username, self._password)
-        if self._auth_mode == "digest":
-            return httpx.DigestAuth(self._username, self._password)
-        return None
-
-    def _auth_from_challenge(self, challenge: str) -> httpx.Auth:
-        scheme = challenge.partition(" ")[0].strip().lower()
-        if scheme == "digest":
-            return httpx.DigestAuth(self._username, self._password)
-        if scheme == "basic":
-            return httpx.BasicAuth(self._username, self._password)
-        raise RuntimeError("CardDAV server returned an unsupported authentication challenge")
 
 
 class PrivateContactsMCPServer:
@@ -1154,18 +1069,10 @@ def discover_carddav_addressbook_url(payload: bytes, *, base_url: str) -> str:
         href = response.find(href_tag)
         if href is not None and href.text:
             discovered_url = urljoin(base_url, href.text.strip())
-            if _url_origin(discovered_url) != _url_origin(base_url):
+            if url_origin(discovered_url) != url_origin(base_url):
                 raise RuntimeError("CardDAV discovery returned a cross-origin address book")
             return discovered_url
     return base_url
-
-
-def _url_origin(value: str) -> tuple[str, str | None, int | None]:
-    parsed = urlsplit(value)
-    port = parsed.port
-    if port is None:
-        port = 443 if parsed.scheme.lower() == "https" else 80
-    return parsed.scheme.lower(), parsed.hostname, port
 
 
 def parse_carddav_multistatus(payload: bytes) -> list[Contact]:
@@ -1216,7 +1123,7 @@ def parse_carddav_multistatus_resources(
 
 
 def _validate_resource_url(resource_url: str, *, addressbook_url: str) -> None:
-    if _url_origin(resource_url) != _url_origin(addressbook_url):
+    if url_origin(resource_url) != url_origin(addressbook_url):
         raise RuntimeError("CardDAV returned a cross-origin contact resource")
     resource_path = urlsplit(resource_url).path
     addressbook_path = urlsplit(addressbook_url).path.rstrip("/") + "/"
@@ -1287,33 +1194,8 @@ def _unique_nonempty(values: Sequence[str]) -> tuple[str, ...]:
 
 
 def create_app(server: PrivateContactsMCPServer | None = None) -> FastAPI:
-    app = FastAPI(title="Minigent private contacts MCP")
     private_contacts = server or PrivateContactsMCPServer()
-
-    @app.post("/mcp", response_model=None)
-    async def mcp_endpoint(request: Request) -> Response | dict[str, Any]:
-        try:
-            payload = await request.json()
-        except ValueError:
-            return _invalid_request_response(-32700, "Invalid JSON")
-        if not isinstance(payload, dict):
-            return _invalid_request_response(-32600, "Payload must be an object")
-        result = await asyncio.to_thread(private_contacts.handle, payload)
-        if result is None:
-            return Response(status_code=202)
-        return result
-
-    return app
-
-
-def _invalid_request_response(code: int, message: str) -> Response:
-    return Response(
-        content=json.dumps(
-            {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}}
-        ),
-        status_code=400,
-        media_type="application/json",
-    )
+    return create_mcp_app(title="Minigent private contacts MCP", handler=private_contacts.handle)
 
 
 app = create_app()

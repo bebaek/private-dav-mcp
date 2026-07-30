@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import json
 import os
 import secrets
 import time
@@ -17,9 +15,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 
+from private_dav_mcp.mcp_http import create_mcp_app
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
+from private_dav_mcp.webdav import (
+    DAVHTTPClient,
+    url_origin,
+    validate_http_url,
+    validate_same_origin_url,
+    xml_headers,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8768
@@ -35,7 +41,6 @@ CALDAV_URL_ENV = "MINIGENT_CALDAV_URL"
 CALDAV_USERNAME_ENV = "MINIGENT_CALDAV_USERNAME"
 CALDAV_PASSWORD_ENV = "MINIGENT_CALDAV_PASSWORD"
 CALDAV_AUTH_MODE_ENV = "MINIGENT_CALDAV_AUTH_MODE"
-CALDAV_AUTH_MODES = {"auto", "basic", "digest"}
 DAV_NAMESPACE = "DAV:"
 CALDAV_NAMESPACE = "urn:ietf:params:xml:ns:caldav"
 APPLE_NAMESPACE = "http://apple.com/ns/ical/"
@@ -355,40 +360,44 @@ class CalDAVCalendarSource:
         timeout_seconds: float = 30.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        _validate_base_url(calendar_url)
+        validate_http_url(calendar_url, label="CalDAV URL")
         if not username or not password:
             raise ValueError("CalDAV username and password are required")
-        normalized_auth_mode = auth_mode.strip().lower()
-        if normalized_auth_mode not in CALDAV_AUTH_MODES:
-            raise ValueError("CalDAV auth mode must be auto, basic, or digest")
         self._calendar_url = calendar_url
-        self._username = username
-        self._password = password
-        self._auth_mode = normalized_auth_mode
-        self._verify_tls = verify_tls
-        self._timeout_seconds = timeout_seconds
-        self._transport = transport
+        self._http = DAVHTTPClient(
+            protocol_name="CalDAV",
+            username=username,
+            password=password,
+            auth_mode=auth_mode,
+            verify_tls=verify_tls,
+            timeout_seconds=timeout_seconds,
+            max_response_bytes=MAX_CALDAV_RESPONSE_BYTES,
+            response_size_message="CalDAV response exceeded the private calendar size limit",
+            changed_message="CalDAV event changed; list it again before retrying",
+            not_found_message="CalDAV calendar or event no longer exists",
+            transport=transport,
+        )
 
     def list_calendars(self) -> list[Calendar]:
-        with self._client() as client:
+        with self._http.client() as client:
             response, _auth, home_url = self._discover(client)
         return parse_caldav_calendars(response.content, base_url=home_url)
 
     def list_event_resources(
         self, calendar: Calendar, *, start: datetime, end: datetime, limit: int
     ) -> tuple[list[EventResource], bool]:
-        with self._client() as client:
+        with self._http.client() as client:
             _response, auth, home_url = self._discover(client)
             _validate_collection_url(calendar.href, base_url=home_url)
-            response = self._request(
+            response = self._http.request(
                 client,
                 "REPORT",
                 calendar.href,
                 auth=auth,
-                headers=self._xml_headers(),
+                headers=xml_headers(),
                 content=_calendar_query_body(start, end),
             )
-        self._check_response_size(response.content)
+        self._http.check_response_size(response.content)
         resources = parse_caldav_event_resources(response.content, calendar_url=calendar.href)
         return resources[:limit], len(resources) > limit
 
@@ -396,11 +405,11 @@ class CalDAVCalendarSource:
         uid = str(uuid4())
         payload = serialize_icalendar(event, uid=uid)
         href = f"{calendar.href.rstrip('/')}/{quote(uid, safe='')}.ics"
-        with self._client() as client:
+        with self._http.client() as client:
             _response, auth, home_url = self._discover(client)
             _validate_collection_url(calendar.href, base_url=home_url)
             _validate_resource_url(href, calendar_url=calendar.href)
-            response = self._request(
+            response = self._http.request(
                 client,
                 "PUT",
                 href,
@@ -419,11 +428,11 @@ class CalDAVCalendarSource:
             event,
             patch=patch,
         )
-        with self._client() as client:
+        with self._http.client() as client:
             _response, auth, home_url = self._discover(client)
             _validate_collection_url(resource.calendar_href, base_url=home_url)
             _validate_resource_url(resource.href, calendar_url=resource.calendar_href)
-            response = self._request(
+            response = self._http.request(
                 client,
                 "PUT",
                 resource.href,
@@ -446,11 +455,11 @@ class CalDAVCalendarSource:
     def delete_event(self, resource: EventResource) -> None:
         if not resource.href or not resource.etag:
             raise RuntimeError("Event has no writable resource or ETag; list it again")
-        with self._client() as client:
+        with self._http.client() as client:
             _response, auth, home_url = self._discover(client)
             _validate_collection_url(resource.calendar_href, base_url=home_url)
             _validate_resource_url(resource.href, calendar_url=resource.calendar_href)
-            self._request(
+            self._http.request(
                 client,
                 "DELETE",
                 resource.href,
@@ -458,120 +467,45 @@ class CalDAVCalendarSource:
                 headers={"If-Match": resource.etag},
             )
 
-    def _client(self) -> httpx.Client:
-        return httpx.Client(
-            verify=self._verify_tls,
-            timeout=self._timeout_seconds,
-            transport=self._transport,
-        )
-
     def _discover(self, client: httpx.Client) -> tuple[httpx.Response, httpx.Auth | None, str]:
-        auth = self._configured_auth()
-        response = client.request(
+        response, auth = self._http.request_with_auth_negotiation(
+            client,
             "PROPFIND",
             self._calendar_url,
-            auth=auth,
-            headers=self._xml_headers(depth="0"),
+            headers=xml_headers(depth="0"),
             content=CALDAV_HOME_PROPFIND_BODY,
+            operation="calendar-home discovery",
         )
-        if self._auth_mode == "auto" and response.status_code == 401:
-            auth = self._auth_from_challenge(response.headers.get("www-authenticate", ""))
-            response = client.request(
-                "PROPFIND",
-                self._calendar_url,
-                auth=auth,
-                headers=self._xml_headers(depth="0"),
-                content=CALDAV_HOME_PROPFIND_BODY,
-            )
-        self._raise_for_status(response, operation="calendar-home discovery")
-        self._check_response_size(response.content)
+        self._http.check_response_size(response.content)
         home_url, principal_url = discover_caldav_home_urls(
             response.content, base_url=self._calendar_url
         )
         if home_url is None and principal_url is not None:
-            principal_response = self._request(
+            principal_response = self._http.request(
                 client,
                 "PROPFIND",
                 principal_url,
                 auth=auth,
-                headers=self._xml_headers(depth="0"),
+                headers=xml_headers(depth="0"),
                 content=CALDAV_HOME_PROPFIND_BODY,
             )
-            self._check_response_size(principal_response.content)
+            self._http.check_response_size(principal_response.content)
             home_url, _unused_principal = discover_caldav_home_urls(
                 principal_response.content, base_url=self._calendar_url
             )
         if home_url is None:
             home_url = self._calendar_url
-        _validate_same_origin_url(home_url, base_url=self._calendar_url, label="calendar home")
-        calendar_response = self._request(
+        validate_same_origin_url(home_url, base_url=self._calendar_url, label="calendar home")
+        calendar_response = self._http.request(
             client,
             "PROPFIND",
             home_url,
             auth=auth,
-            headers=self._xml_headers(depth="1"),
+            headers=xml_headers(depth="1"),
             content=CALENDAR_PROPFIND_BODY,
         )
-        self._check_response_size(calendar_response.content)
+        self._http.check_response_size(calendar_response.content)
         return calendar_response, auth, home_url
-
-    def _request(
-        self,
-        client: httpx.Client,
-        method: str,
-        url: str,
-        *,
-        auth: httpx.Auth | None,
-        headers: dict[str, str],
-        content: bytes | None = None,
-    ) -> httpx.Response:
-        try:
-            response = client.request(method, url, auth=auth, headers=headers, content=content)
-        except httpx.HTTPError as exc:
-            raise RuntimeError("CalDAV request failed") from exc
-        self._raise_for_status(response, operation=method.lower())
-        return response
-
-    @staticmethod
-    def _raise_for_status(response: httpx.Response, *, operation: str) -> None:
-        if response.status_code == 412:
-            raise RuntimeError("CalDAV event changed; list it again before retrying")
-        if response.status_code == 404:
-            raise RuntimeError("CalDAV calendar or event no longer exists")
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise RuntimeError(
-                f"CalDAV {operation} failed with HTTP {response.status_code}"
-            ) from exc
-
-    @staticmethod
-    def _xml_headers(*, depth: str = "1") -> dict[str, str]:
-        return {
-            "Depth": depth,
-            "Content-Type": "application/xml; charset=utf-8",
-            "Accept": "application/xml",
-        }
-
-    @staticmethod
-    def _check_response_size(content: bytes) -> None:
-        if len(content) > MAX_CALDAV_RESPONSE_BYTES:
-            raise RuntimeError("CalDAV response exceeded the private calendar size limit")
-
-    def _configured_auth(self) -> httpx.Auth | None:
-        if self._auth_mode == "basic":
-            return httpx.BasicAuth(self._username, self._password)
-        if self._auth_mode == "digest":
-            return httpx.DigestAuth(self._username, self._password)
-        return None
-
-    def _auth_from_challenge(self, challenge: str) -> httpx.Auth:
-        scheme = challenge.partition(" ")[0].strip().lower()
-        if scheme == "digest":
-            return httpx.DigestAuth(self._username, self._password)
-        if scheme == "basic":
-            return httpx.BasicAuth(self._username, self._password)
-        raise RuntimeError("CalDAV server returned an unsupported authentication challenge")
 
 
 class PrivateCalendarMCPServer:
@@ -886,30 +820,8 @@ class PrivateCalendarMCPServer:
         return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
 
-def _validate_base_url(value: str) -> None:
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise ValueError("CalDAV URL must use HTTP or HTTPS")
-    if parsed.username or parsed.password:
-        raise ValueError("CalDAV credentials must not be embedded in the URL")
-
-
-def _url_origin(value: str) -> tuple[str, str | None, int]:
-    parsed = urlsplit(value)
-    return (
-        parsed.scheme.lower(),
-        parsed.hostname,
-        parsed.port or (443 if parsed.scheme == "https" else 80),
-    )
-
-
-def _validate_same_origin_url(value: str, *, base_url: str, label: str) -> None:
-    if _url_origin(value) != _url_origin(base_url):
-        raise RuntimeError(f"CalDAV discovery returned a cross-origin {label}")
-
-
 def _validate_collection_url(value: str, *, base_url: str) -> None:
-    if _url_origin(value) != _url_origin(base_url):
+    if url_origin(value) != url_origin(base_url):
         raise RuntimeError("CalDAV discovery returned a cross-origin calendar")
     base_path = urlsplit(base_url).path.rstrip("/") + "/"
     if not urlsplit(value).path.startswith(base_path):
@@ -917,7 +829,7 @@ def _validate_collection_url(value: str, *, base_url: str) -> None:
 
 
 def _validate_resource_url(value: str, *, calendar_url: str) -> None:
-    if _url_origin(value) != _url_origin(calendar_url):
+    if url_origin(value) != url_origin(calendar_url):
         raise RuntimeError("CalDAV returned a cross-origin event resource")
     calendar_path = urlsplit(calendar_url).path.rstrip("/") + "/"
     if not urlsplit(value).path.startswith(calendar_path):
@@ -938,7 +850,7 @@ def discover_caldav_home_urls(payload: bytes, *, base_url: str) -> tuple[str | N
         if href_element is None or not href_element.text:
             return None
         value = urljoin(base_url, href_element.text.strip())
-        _validate_same_origin_url(value, base_url=base_url, label=name)
+        validate_same_origin_url(value, base_url=base_url, label=name)
         return value
 
     return (
@@ -1426,33 +1338,8 @@ def _same_event_resource(left: EventResource, right: EventResource) -> bool:
 
 
 def create_app(server: PrivateCalendarMCPServer | None = None) -> FastAPI:
-    app = FastAPI(title="Minigent private calendar MCP")
     private_calendar = server or PrivateCalendarMCPServer()
-
-    @app.post("/mcp", response_model=None)
-    async def mcp_endpoint(request: Request) -> Response | dict[str, Any]:
-        try:
-            payload = await request.json()
-        except ValueError:
-            return _invalid_request_response(-32700, "Invalid JSON")
-        if not isinstance(payload, dict):
-            return _invalid_request_response(-32600, "Payload must be an object")
-        result = await asyncio.to_thread(private_calendar.handle, payload)
-        if result is None:
-            return Response(status_code=202)
-        return result
-
-    return app
-
-
-def _invalid_request_response(code: int, message: str) -> Response:
-    return Response(
-        content=json.dumps(
-            {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}}
-        ),
-        status_code=400,
-        media_type="application/json",
-    )
+    return create_mcp_app(title="Minigent private calendar MCP", handler=private_calendar.handle)
 
 
 app = create_app()
