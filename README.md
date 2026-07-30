@@ -29,6 +29,12 @@ The versioned Minigent integration contract is documented in
 processes, and runs the black-box suite in `tests/test_container_contract.py` against their HTTP
 endpoints.
 
+The accepted next architecture evolves these sidecars into an identity-aware, multi-tenant DAV
+privacy gateway with a management API and MCP interface. See
+[ADR 0001](docs/adr/0001-multitenant-dav-privacy-gateway.md) and the draft
+[gateway contract v1](docs/gateway-contract-v1.md). These documents describe planned behavior and
+do not replace the current executable sidecar contract yet.
+
 To run that suite locally:
 
 ```bash

@@ -1,0 +1,505 @@
+# DAV privacy gateway API and MCP contract v1
+
+**Status:** Draft for implementation
+
+This contract specifies the first multi-tenant CalDAV gateway described by
+[ADR 0001](adr/0001-multitenant-dav-privacy-gateway.md). It is separate from the existing
+single-account [MCP compatibility contract v1](contract-v1.md), which remains supported during
+migration.
+
+Normative terms such as **MUST**, **MUST NOT**, and **SHOULD** have their usual RFC 2119 meanings.
+
+## Common conventions
+
+### Base URLs and content types
+
+- Management API routes are rooted at `/v1` and use `application/json`.
+- MCP uses stateless JSON-RPC requests at `POST /mcp`.
+- Health routes remain `GET /health/live` and `GET /health/ready`.
+- Timestamps use RFC 3339 UTC strings.
+- Request and response bodies MUST reject unknown fields unless a schema explicitly permits them.
+
+### Authentication
+
+Every `/v1` and `/mcp` request MUST include:
+
+```http
+Authorization: Bearer <short-lived identity token>
+```
+
+The token MUST be asymmetrically signed and contain:
+
+```json
+{
+  "iss": "https://minigent.example",
+  "aud": "private-dav",
+  "sub": "stable-user-id",
+  "tenant_id": "stable-tenant-id",
+  "scope": "dav:accounts:read dav:calendar:read",
+  "iat": 1785451200,
+  "exp": 1785451500,
+  "jti": "unique-token-id"
+}
+```
+
+The gateway MUST derive ownership from verified `tenant_id` and `sub` claims. Neither field is a
+valid API property or MCP argument. Tokens with an invalid signature, issuer, audience, lifetime,
+or required claim return `401`. Valid tokens without the required scope return `403`.
+
+Recommended maximum token lifetime is five minutes. Logs MAY retain a one-way hash of `jti` for
+correlation but MUST NOT retain the token.
+
+### Scopes
+
+| Scope | Permission |
+| --- | --- |
+| `dav:accounts:read` | Read account configuration and connection state through REST |
+| `dav:accounts:write` | Add, update, test, disable, or remove accounts through REST |
+| `dav:calendar:read` | Use read-only calendar MCP tools |
+| `dav:calendar:write` | Use event mutation MCP tools |
+
+`dav:accounts:write` does not imply calendar access, and `dav:calendar:write` does not permit
+credential management.
+
+### References
+
+- `account_ref` is a stable random identifier owned by the authenticated user.
+- `calendar_ref` and `event_ref` are high-entropy, expiring, account-bound references.
+- References MUST NOT encode credentials, upstream URLs, owner identifiers, or database keys.
+- Reference lookup MUST constrain owner, type, and account before returning a record.
+- A missing, expired, cross-owner, cross-account, or wrong-type reference MUST produce the same
+  non-enumerating error.
+- References MUST NOT be displayed to users or treated as authorization credentials.
+
+### Secret handling
+
+Credential properties are write-only. They MUST be accepted only over TLS, encrypted before
+persistence, omitted from all responses, and redacted from logs and traces. API validation errors
+MUST identify the invalid property without echoing its value.
+
+Account and calendar labels are private user data. The REST API may return them to the authenticated
+user. MCP MUST protect them with the private-value envelope.
+
+## REST management API
+
+### Account representation
+
+```json
+{
+  "account_ref": "acct_opaque",
+  "kind": "caldav",
+  "label": "Personal calendar",
+  "base_url": "https://dav.example/dav.php",
+  "auth_type": "password",
+  "auth_mode": "auto",
+  "username_hint": "a…@example.com",
+  "status": "ready",
+  "enabled": true,
+  "last_checked_at": "2026-07-30T22:00:00Z",
+  "last_error": null,
+  "created_at": "2026-07-30T21:00:00Z",
+  "updated_at": "2026-07-30T22:00:00Z"
+}
+```
+
+`status` is one of `pending`, `ready`, `error`, or `disabled`. `last_error`, when present, is a
+stable non-sensitive code such as `authentication_failed`, `connection_failed`,
+`tls_validation_failed`, `url_not_allowed`, or `dav_discovery_failed`. It MUST NOT contain an
+upstream response body or exception string.
+
+`username_hint` is optional and MUST reveal no more than necessary to distinguish accounts. The
+full username and all credential material are never returned.
+
+### List accounts
+
+```http
+GET /v1/accounts
+Scope: dav:accounts:read
+```
+
+Response:
+
+```json
+{
+  "accounts": [],
+  "next_cursor": null
+}
+```
+
+Pagination uses opaque `cursor` and bounded `limit` query parameters. Results include only records
+owned by the authenticated user.
+
+### Add an account
+
+```http
+POST /v1/accounts
+Scope: dav:accounts:write
+Idempotency-Key: <client-generated opaque value>
+```
+
+Password-account request:
+
+```json
+{
+  "kind": "caldav",
+  "label": "Personal calendar",
+  "base_url": "https://dav.example/dav.php",
+  "auth": {
+    "type": "password",
+    "username": "alice@example.com",
+    "password": "write-only secret",
+    "mode": "auto"
+  },
+  "enabled": true
+}
+```
+
+The gateway validates outbound URL policy, encrypts the account, performs principal and calendar
+home discovery, and returns `201` with the account representation. A failed connection test returns
+a non-sensitive `422` and MUST NOT persist the account. Repeating a request with the same owner and
+`Idempotency-Key` returns the original result and MUST NOT create another account.
+
+Initial limits:
+
+- `label`: 1–100 Unicode characters;
+- `base_url`: HTTPS, no embedded credentials or fragment;
+- `username`: 1–320 characters;
+- `password`: 1–4096 characters;
+- `mode`: `auto`, `basic`, or `digest`.
+
+OAuth account creation will use a provider-specific browser flow in a later contract revision;
+refresh tokens are not accepted by this endpoint in v1.
+
+### Get an account
+
+```http
+GET /v1/accounts/{account_ref}
+Scope: dav:accounts:read
+```
+
+Returns the account representation. A reference not owned by the caller returns `404`.
+
+### Update or rotate an account
+
+```http
+PATCH /v1/accounts/{account_ref}
+Scope: dav:accounts:write
+```
+
+Request properties are optional:
+
+```json
+{
+  "label": "Updated label",
+  "base_url": "https://new-dav.example/dav.php",
+  "enabled": true,
+  "auth": {
+    "type": "password",
+    "username": "alice@example.com",
+    "password": "replacement secret",
+    "mode": "digest"
+  }
+}
+```
+
+Changing `base_url` or `auth` requires a successful connection test before the new encrypted values
+replace the current values. The update is atomic: failed validation leaves the old account usable.
+Disabling an account prevents new DAV calls and invalidates its outstanding calendar and event
+references.
+
+### Test an account
+
+```http
+POST /v1/accounts/{account_ref}/test
+Scope: dav:accounts:write
+```
+
+Response:
+
+```json
+{
+  "status": "ready",
+  "calendar_count": 3,
+  "checked_at": "2026-07-30T22:00:00Z"
+}
+```
+
+The route performs a live DAV discovery check. Failures use stable error codes and do not expose
+private calendar names or upstream response bodies.
+
+### Delete an account
+
+```http
+DELETE /v1/accounts/{account_ref}
+Scope: dav:accounts:write
+```
+
+Returns `204`. Deletion removes the encrypted credential record, calendar preferences, wrapped
+DEK, and outstanding references. Audit retention MAY keep non-sensitive identifiers and outcome
+codes but MUST NOT keep labels, credentials, URLs, usernames, or event fields.
+
+### List and configure discovered calendars
+
+```http
+GET /v1/accounts/{account_ref}/calendars
+Scope: dav:accounts:read
+```
+
+Response:
+
+```json
+{
+  "calendars": [
+    {
+      "calendar_ref": "cal_opaque",
+      "name": "Personal",
+      "color": "#3366cc",
+      "enabled": true,
+      "read_only": false
+    }
+  ]
+}
+```
+
+The REST representation may show calendar names to the authenticated user. Upstream hrefs are
+never returned.
+
+```http
+PATCH /v1/accounts/{account_ref}/calendars/{calendar_ref}
+Scope: dav:accounts:write
+```
+
+```json
+{"enabled": false}
+```
+
+A disabled calendar is excluded from implicit multi-calendar free/busy and rejects event access.
+
+## MCP interface
+
+### Lifecycle
+
+The gateway implements MCP protocol version `2025-11-25`. `initialize` returns server name
+`private-dav-gateway`. `notifications/initialized`, `tools/list`, validation behavior, and the
+private-value envelope retain the behavior defined by `docs/contract-v1.md`.
+
+Authentication is evaluated on every JSON-RPC HTTP request. MCP reference state MUST NOT be shared
+across authenticated owners.
+
+### Private-value envelope
+
+Private MCP results use:
+
+```json
+{
+  "content": [{"type": "text", "text": "Non-private summary."}],
+  "structuredContent": {"name": "{{pii:calendar:reference}}"},
+  "_meta": {
+    "io.minigent/private-values": {
+      "reference": "Private calendar name"
+    }
+  }
+}
+```
+
+The gateway MUST NOT place account labels, calendar names, event summaries, descriptions,
+locations, attendees, usernames, URLs, or credentials in model-visible text or structured content.
+
+### Tool catalog
+
+The gateway v1 MCP server exposes:
+
+- `calendar_accounts_list`
+- `calendars_list`
+- `events_list`
+- `events_get`
+- `free_busy`
+- `events_create`
+- `events_update`
+- `events_delete`
+
+Account creation, credential submission, connection testing, and account deletion are REST-only.
+
+### `calendar_accounts_list`
+
+Arguments:
+
+```json
+{}
+```
+
+Requires `dav:calendar:read`. Returns enabled accounts with `account_ref`, protected `label`, and a
+non-sensitive `status`. It does not return URLs or username hints.
+
+### `calendars_list`
+
+Arguments:
+
+```json
+{"account_ref": "optional_account_ref"}
+```
+
+Requires `dav:calendar:read`. With no `account_ref`, lists calendars from all enabled accounts.
+Each result contains its internal `account_ref`, an expiring `calendar_ref`, a protected name,
+optional non-sensitive color, and `read_only`. Results from unavailable accounts may be omitted;
+the response includes non-sensitive `partial` and `failed_account_count` fields.
+
+### `events_list`
+
+Arguments:
+
+```json
+{
+  "calendar_ref": "cal_opaque",
+  "start": "2026-08-01T00:00:00Z",
+  "end": "2026-09-01T00:00:00Z",
+  "limit": 25
+}
+```
+
+Requires `dav:calendar:read`. The range is required and MUST NOT exceed 366 days. The result retains
+the current protected-summary event shape and returns account-bound `event_ref` values.
+
+### `events_get`
+
+Arguments:
+
+```json
+{
+  "event_ref": "event_opaque",
+  "fields": ["description", "location", "attendees"]
+}
+```
+
+Requires `dav:calendar:read`. Only requested fields are returned, and each private value is
+protected by the envelope.
+
+### `free_busy`
+
+Arguments:
+
+```json
+{
+  "calendar_refs": ["cal_opaque_1", "cal_opaque_2"],
+  "start": "2026-08-01T00:00:00Z",
+  "end": "2026-08-08T00:00:00Z",
+  "limit": 100
+}
+```
+
+For migration, a single `calendar_ref` MAY be supplied instead of `calendar_refs`; supplying both
+is invalid. If neither is supplied, the gateway queries all enabled calendars owned by the caller.
+The time range is required and MUST NOT exceed 366 days.
+
+Requires `dav:calendar:read`. Accounts are queried concurrently under bounded per-account and
+overall deadlines. Busy intervals are normalized to UTC and merged across calendars. The result
+contains no private-value entries:
+
+```json
+{
+  "busy": [
+    {"start": "2026-08-01T14:00:00Z", "end": "2026-08-01T15:30:00Z"}
+  ],
+  "truncated": false,
+  "partial": false,
+  "queried_calendar_count": 2,
+  "failed_calendar_count": 0
+}
+```
+
+A provider failure does not reveal which private account failed. If every selected calendar fails,
+the tool returns an execution error rather than an empty availability result. `limit` applies after
+interval merging.
+
+### Event mutations
+
+`events_create`, `events_update`, and `events_delete` require `dav:calendar:write` and retain the v1
+schemas, ETag behavior, TZID preservation, and recurring-series scope rules. A `calendar_ref` or
+`event_ref` binds each mutation to exactly one owner and account.
+
+The gateway executes a valid authorized mutation but does not replace Minigent's exact-call user
+approval. Minigent MUST resolve approved private placeholders and obtain approval before invoking a
+mutation. The gateway records a non-sensitive mutation audit event containing owner, account
+record ID, operation, outcome, request correlation ID, and timestamp—never event fields.
+
+## Errors
+
+### REST error shape
+
+```json
+{
+  "error": {
+    "code": "invalid_request",
+    "message": "Request validation failed.",
+    "request_id": "req_opaque",
+    "fields": {"base_url": "URL is not allowed."}
+  }
+}
+```
+
+Stable REST codes include:
+
+- `authentication_required` (`401`)
+- `permission_denied` (`403`)
+- `not_found` (`404`)
+- `conflict` (`409`)
+- `invalid_request` (`422`)
+- `url_not_allowed` (`422`)
+- `authentication_failed` (`422` for onboarding/test)
+- `upstream_unavailable` (`502` or `503`)
+- `rate_limited` (`429`)
+
+### MCP errors
+
+- malformed tool arguments: `-32602`;
+- unknown, expired, disabled, or unauthorized opaque reference: `-32001`;
+- all selected upstreams unavailable: `-32002`;
+- stale ETag or changed resource: `-32003`;
+- valid token without tool scope: HTTP `403` before JSON-RPC execution.
+
+Messages MUST remain non-sensitive and MUST NOT distinguish cross-owner references from unknown
+references.
+
+## Operational limits
+
+Implementations MUST enforce configurable limits with conservative defaults:
+
+- accounts per user: 10;
+- concurrent upstream calls per user: 5;
+- event/free-busy window: 366 days;
+- upstream redirects: 3;
+- upstream response size: existing DAV v1 limits or lower;
+- account and request rate limits keyed by verified owner;
+- calendar and event reference TTL: no more than 24 hours.
+
+Account limits and rate limits return stable non-sensitive errors. One user's exhausted quota MUST
+not reduce another tenant's authorization boundary.
+
+## Audit and observability
+
+The gateway records security and lifecycle events for account creation, credential rotation,
+connection tests, account deletion, reference rejection, and event mutation. Records may contain
+internal account IDs, owner IDs, operation, status code, latency, and correlation ID. They MUST NOT
+contain credentials, bearer tokens, private labels, DAV URLs, usernames, event data, calendar
+names, attendee data, MCP private envelopes, or raw upstream bodies.
+
+Metrics use aggregate provider/auth-mode and outcome dimensions. Tenant, user, account, calendar,
+and event identifiers MUST NOT be metric labels.
+
+## Conformance requirements
+
+The executable gateway conformance suite must cover:
+
+1. REST account lifecycle without credential disclosure;
+2. token signature, issuer, audience, expiry, and scope failures;
+3. cross-tenant and cross-user reference rejection for every tool and route;
+4. encryption round trips and KEK re-wrapping;
+5. URL, redirect, DNS, and response-size SSRF controls;
+6. multi-account free/busy merging, partial failure, deadlines, and concurrency limits;
+7. private-value envelope redaction;
+8. ETag, TZID, recurrence, and approval-bound mutation compatibility;
+9. account disable/delete reference invalidation;
+10. logs, traces, errors, and audit records containing no seeded secret canaries.
+
+Production migration must not remove the existing single-account v1 endpoints until this suite and
+a Minigent end-to-end identity propagation test pass.
