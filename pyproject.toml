@@ -1,0 +1,49 @@
+[project]
+name = "private-dav-mcp"
+version = "0.1.0"
+description = "Privacy-preserving CardDAV and CalDAV MCP sidecars"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "httpx>=0.28,<1.0",
+  "uvicorn>=0.30,<1.0",
+]
+
+[project.scripts]
+private-dav-carddav-mcp = "private_dav_mcp.carddav:main"
+private-dav-caldav-mcp = "private_dav_mcp.caldav:main"
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.20.0",
+  "pytest>=8.0,<9.0",
+  "ruff>=0.11,<1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["private_dav_mcp*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.basedpyright]
+include = ["private_dav_mcp"]
+typeCheckingMode = "standard"
+pythonVersion = "3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.basedpyright/
+build/
+dist/
+*.egg-info/
+.env
+.env.*
+!.env.template
+.DS_Store

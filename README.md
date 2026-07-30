@@ -1,0 +1,84 @@
+# Private DAV MCP
+
+Privacy-preserving CardDAV and CalDAV MCP servers extracted from Minigent. Both servers return
+model-safe `{{pii:kind:reference}}` placeholders and place corresponding private values in the
+protocol-neutral MCP metadata envelope:
+
+```text
+_meta["io.minigent/private-values"]
+```
+
+The envelope is a Minigent extension, not a standard MCP confidential channel. Deploy these
+servers only across a trusted transport; the production setup uses loopback sidecars in the same
+pod as Minigent.
+
+## Development
+
+```bash
+uv sync --dev
+uv run ruff check .
+uv run ruff format --check .
+uv run basedpyright
+uv run pytest
+```
+
+## CardDAV
+
+```bash
+export MINIGENT_CARDDAV_URL='https://dav.example/dav.php'
+export MINIGENT_CARDDAV_USERNAME='user'
+read -r -s MINIGENT_CARDDAV_PASSWORD
+export MINIGENT_CARDDAV_PASSWORD
+uv run private-dav-carddav-mcp --host 127.0.0.1 --port 8767
+```
+
+`MINIGENT_CARDDAV_AUTH_MODE` accepts `auto`, `basic`, or `digest`. Without a URL, the server uses
+fake contacts for local contract testing. Tools:
+
+- `contacts_list`
+- `contacts_get`
+- `contacts_create`
+- `contacts_update`
+- `contacts_delete`
+- `contacts_protect_text`
+
+Create uses `If-None-Match: *`; update and delete use `If-Match` with the listed ETag.
+
+## CalDAV
+
+```bash
+export MINIGENT_CALDAV_URL='https://dav.example/dav.php'
+export MINIGENT_CALDAV_USERNAME='user'
+read -r -s MINIGENT_CALDAV_PASSWORD
+export MINIGENT_CALDAV_PASSWORD
+uv run private-dav-caldav-mcp --host 127.0.0.1 --port 8768
+```
+
+`MINIGENT_CALDAV_AUTH_MODE` accepts `auto`, `basic`, or `digest`. Without a URL, the server uses a
+fake calendar. Tools:
+
+- `calendars_list`
+- `events_list`
+- `events_get`
+- `events_create`
+- `events_update`
+- `events_delete`
+
+The server discovers the current principal and calendar home, requires bounded event queries,
+and rejects ranges over 366 days. Create uses `If-None-Match: *`; update and delete use
+`If-Match`. V1 reads recurring masters but rejects recurring-event updates.
+
+## Security and runtime policy
+
+The MCP servers enforce protocol validation and stale-write checks, but the Minigent runtime owns
+private-value storage, argument resolution, exact-call approval, audit records, and hiding trusted
+input preprocessors. A Minigent CardDAV server configuration should explicitly set:
+
+```json
+{
+  "trusted_input_preprocessor_tools": ["contacts_protect_text"]
+}
+```
+
+Credentials belong only on the corresponding sidecar process. TLS verification is enabled by
+default; `--insecure-skip-tls-verify` is for trusted local development only.
