@@ -45,6 +45,13 @@ PRIVATE_DAV_CALDAV_CONTRACT_URL=http://127.0.0.1:18768/mcp \
 The default in-memory sources are intentionally used for these contract checks; no DAV credentials
 or network service are required. Stop both containers when finished.
 
+## Releases and image security
+
+The production image is vulnerability-scanned before publication, receives attached SBOM and
+provenance attestations, and is signed by the GitHub Actions OIDC identity. Semantic-version tags
+publish matching container tags and generated GitHub release notes. See
+[`docs/releasing.md`](docs/releasing.md) for the release procedure and verification commands.
+
 ## CardDAV
 
 ```bash

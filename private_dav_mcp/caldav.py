@@ -17,6 +17,7 @@ import httpx
 import uvicorn
 from fastapi import FastAPI
 
+from private_dav_mcp import __version__
 from private_dav_mcp.mcp_http import create_mcp_app
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 from private_dav_mcp.webdav import (
@@ -556,7 +557,7 @@ class PrivateCalendarMCPServer:
                 request_id,
                 {
                     "protocolVersion": DEFAULT_MCP_PROTOCOL_VERSION,
-                    "serverInfo": {"name": "minigent-private-calendar", "version": "0.1.0"},
+                    "serverInfo": {"name": "minigent-private-calendar", "version": __version__},
                     "capabilities": {"tools": {}},
                 },
             )

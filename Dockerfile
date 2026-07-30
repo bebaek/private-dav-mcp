@@ -1,24 +1,37 @@
-FROM python:3.11-slim
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93 AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:0.11.29 /uv /uvx /bin/
+COPY --from=ghcr.io/astral-sh/uv:0.11.29@sha256:eb2843a1e56fd9e30c7276ce1a52cba86e64c7b385f5e3279a0e08e02dd058fc /uv /uvx /bin/
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    UV_COMPILE_BYTECODE=1 \
-    UV_LINK_MODE=copy \
-    PATH="/app/.venv/bin:${PATH}"
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
 
 WORKDIR /app
-
-RUN groupadd --system app && useradd --system --gid app --create-home app
 
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY private_dav_mcp ./private_dav_mcp
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --no-editable \
+    && rm -rf /root/.cache/uv
 
-RUN chown -R app:app /app
+FROM python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93 AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:${PATH}"
+
+RUN rm -rf \
+    /usr/local/bin/pip* \
+    /usr/local/lib/python3.11/site-packages/pip* \
+    /usr/local/lib/python3.11/site-packages/setuptools* \
+    /usr/local/lib/python3.11/site-packages/wheel* \
+    && groupadd --system app \
+    && useradd --system --gid app --create-home app
+
+WORKDIR /app
+
+COPY --from=builder --chown=app:app /app/.venv /app/.venv
+
 USER app
 
 EXPOSE 8767 8768
