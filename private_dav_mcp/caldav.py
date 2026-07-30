@@ -20,6 +20,7 @@ from fastapi import FastAPI
 from private_dav_mcp.mcp_http import create_mcp_app
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 from private_dav_mcp.webdav import (
+    DAV_READINESS_TIMEOUT_SECONDS,
     DAVHTTPClient,
     url_origin,
     validate_http_url,
@@ -268,6 +269,8 @@ class CalendarSource(Protocol):
 
     def delete_event(self, resource: EventResource) -> None: ...
 
+    def check_ready(self) -> None: ...
+
 
 class StaticCalendarSource:
     def __init__(
@@ -341,6 +344,9 @@ class StaticCalendarSource:
     def delete_event(self, resource: EventResource) -> None:
         self._resources.pop(self._resource_index(resource))
 
+    def check_ready(self) -> None:
+        return None
+
     def _resource_index(self, resource: EventResource) -> int:
         for index, current in enumerate(self._resources):
             if current.href == resource.href:
@@ -377,6 +383,10 @@ class CalDAVCalendarSource:
             not_found_message="CalDAV calendar or event no longer exists",
             transport=transport,
         )
+
+    def check_ready(self) -> None:
+        with self._http.client(timeout_seconds=DAV_READINESS_TIMEOUT_SECONDS) as client:
+            self._discover(client)
 
     def list_calendars(self) -> list[Calendar]:
         with self._http.client() as client:
@@ -532,6 +542,9 @@ class PrivateCalendarMCPServer:
         self._ttl = reference_ttl_seconds
         self._clock = clock
         self._references: dict[str, CachedReference] = {}
+
+    def check_ready(self) -> None:
+        self._source.check_ready()
 
     def handle(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")
@@ -1339,7 +1352,11 @@ def _same_event_resource(left: EventResource, right: EventResource) -> bool:
 
 def create_app(server: PrivateCalendarMCPServer | None = None) -> FastAPI:
     private_calendar = server or PrivateCalendarMCPServer()
-    return create_mcp_app(title="Minigent private calendar MCP", handler=private_calendar.handle)
+    return create_mcp_app(
+        title="Minigent private calendar MCP",
+        handler=private_calendar.handle,
+        readiness_check=private_calendar.check_ready,
+    )
 
 
 app = create_app()

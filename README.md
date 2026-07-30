@@ -91,6 +91,20 @@ The server discovers the current principal and calendar home, requires bounded e
 and rejects ranges over 366 days. Create uses `If-None-Match: *`; update and delete use
 `If-Match`. V1 reads recurring masters but rejects recurring-event updates.
 
+## Health checks
+
+Both server processes expose:
+
+- `GET /health/live` — process liveness only; it does not contact the DAV server.
+- `GET /health/ready` — validates the configured CardDAV or CalDAV source. Upstream results,
+  including failures, are cached for 30 seconds so frequent orchestrator probes do not repeatedly
+  authenticate against DAV. The endpoint returns `200 {"status":"ready"}` or a non-sensitive
+  `503 {"status":"not_ready"}` response.
+
+When no DAV URL is configured, the in-memory development source is immediately ready. Use the
+liveness route for a Kubernetes liveness probe and the readiness route for readiness and startup
+probes.
+
 ## Security and runtime policy
 
 The MCP servers enforce protocol validation and stale-write checks, but the Minigent runtime owns

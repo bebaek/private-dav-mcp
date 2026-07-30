@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 import pytest
 
-from private_dav_mcp.mcp_http import create_mcp_app
+from private_dav_mcp.mcp_http import CachedReadinessCheck, create_mcp_app
 from private_dav_mcp.webdav import (
     DAVHTTPClient,
     url_origin,
@@ -46,7 +46,8 @@ def test_dav_http_client_configures_basic_auth_and_headers() -> None:
         return httpx.Response(207)
 
     dav = _dav_client(auth_mode="basic", transport=httpx.MockTransport(handler))
-    with dav.client() as client:
+    with dav.client(timeout_seconds=2) as client:
+        assert client.timeout.connect == 2
         response, auth = dav.request_with_auth_negotiation(
             client,
             "PROPFIND",
@@ -103,6 +104,35 @@ def test_shared_url_validation_normalizes_default_ports_and_rejects_credentials(
         validate_http_url("https://user:password@dav.example/root", label="DAV URL")
 
 
+def test_cached_readiness_check_caches_failures_and_successes() -> None:
+    now = [0.0]
+    failing = [True]
+    calls = [0]
+
+    def check() -> None:
+        calls[0] += 1
+        if failing[0]:
+            raise RuntimeError("upstream unavailable")
+
+    readiness = CachedReadinessCheck(check, ttl_seconds=30, clock=lambda: now[0])
+
+    assert readiness.is_ready() is False
+    assert readiness.is_ready() is False
+    assert calls[0] == 1
+
+    failing[0] = False
+    now[0] = 30
+    assert readiness.is_ready() is True
+    assert readiness.is_ready() is True
+    assert calls[0] == 2
+
+
+def test_cached_readiness_check_without_upstream_is_ready() -> None:
+    assert CachedReadinessCheck(None).is_ready() is True
+    with pytest.raises(ValueError, match="TTL must be positive"):
+        CachedReadinessCheck(None, ttl_seconds=0)
+
+
 def test_shared_mcp_http_app_handles_results_notifications_and_invalid_payloads() -> None:
     def handler(payload: dict[str, Any]) -> dict[str, Any] | None:
         if payload.get("id") is None:
@@ -114,6 +144,14 @@ def test_shared_mcp_http_app_handles_results_notifications_and_invalid_payloads(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://mcp.test"
         ) as client:
+            live = await client.get("/health/live")
+            assert live.status_code == 200
+            assert live.json() == {"status": "ok"}
+
+            ready = await client.get("/health/ready")
+            assert ready.status_code == 200
+            assert ready.json() == {"status": "ready"}
+
             success = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
             assert success.status_code == 200
             assert success.json()["result"] == {"ok": True}
@@ -133,5 +171,27 @@ def test_shared_mcp_http_app_handles_results_notifications_and_invalid_payloads(
             array_payload = await client.post("/mcp", json=[])
             assert array_payload.status_code == 400
             assert array_payload.json()["error"]["code"] == -32600
+
+    asyncio.run(run())
+
+
+def test_shared_mcp_http_app_reports_failed_readiness_without_details() -> None:
+    def unavailable() -> None:
+        raise RuntimeError("secret upstream details")
+
+    async def run() -> None:
+        app = create_mcp_app(
+            title="Unavailable test", handler=lambda _payload: None, readiness_check=unavailable
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://mcp.test"
+        ) as client:
+            live = await client.get("/health/live")
+            ready = await client.get("/health/ready")
+
+        assert live.status_code == 200
+        assert ready.status_code == 503
+        assert ready.json() == {"status": "not_ready"}
+        assert "secret" not in ready.text
 
     asyncio.run(run())

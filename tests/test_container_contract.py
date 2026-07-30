@@ -273,7 +273,16 @@ def test_caldav_container_contract(caldav: MCPContractClient) -> None:
     assert "366 days" in unbounded["error"]["message"]
 
 
-def test_http_and_json_rpc_error_contract(carddav: MCPContractClient) -> None:
+def test_http_health_and_json_rpc_error_contract(carddav: MCPContractClient) -> None:
+    for url in (CARDDAV_URL, CALDAV_URL):
+        base_url = url.removesuffix("/mcp")
+        live = httpx.get(f"{base_url}/health/live", timeout=5)
+        ready = httpx.get(f"{base_url}/health/ready", timeout=5)
+        assert live.status_code == 200
+        assert live.json() == {"status": "ok"}
+        assert ready.status_code == 200
+        assert ready.json() == {"status": "ready"}
+
     notification = httpx.post(
         CARDDAV_URL,
         json={"jsonrpc": "2.0", "method": "notifications/initialized"},

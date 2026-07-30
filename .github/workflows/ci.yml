@@ -80,9 +80,7 @@ jobs:
             ready=false
             for attempt in $(seq 1 30); do
               if curl --fail --silent --show-error \
-                --header 'Content-Type: application/json' \
-                --data '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
-                "http://127.0.0.1:${port}/mcp" >/dev/null; then
+                "http://127.0.0.1:${port}/health/ready" >/dev/null; then
                 ready=true
                 break
               fi

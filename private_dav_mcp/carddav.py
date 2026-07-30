@@ -18,7 +18,13 @@ from fastapi import FastAPI
 
 from private_dav_mcp.mcp_http import create_mcp_app
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
-from private_dav_mcp.webdav import DAVHTTPClient, url_origin, validate_http_url, xml_headers
+from private_dav_mcp.webdav import (
+    DAV_READINESS_TIMEOUT_SECONDS,
+    DAVHTTPClient,
+    url_origin,
+    validate_http_url,
+    xml_headers,
+)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
@@ -276,6 +282,8 @@ class ContactSource(Protocol):
 
     def delete_contact(self, resource: ContactResource) -> None: ...
 
+    def check_ready(self) -> None: ...
+
 
 class StaticContactSource:
     def __init__(self, contacts: Sequence[Contact] = DEMO_CONTACTS) -> None:
@@ -325,6 +333,9 @@ class StaticContactSource:
     def delete_contact(self, resource: ContactResource) -> None:
         self._resources.pop(self._resource_index(resource))
 
+    def check_ready(self) -> None:
+        return None
+
     def _resource_index(self, resource: ContactResource) -> int:
         for index, current in enumerate(self._resources):
             if current.href == resource.href:
@@ -365,6 +376,10 @@ class CardDAVContactSource:
             not_found_message="CardDAV contact no longer exists",
             transport=transport,
         )
+
+    def check_ready(self) -> None:
+        with self._http.client(timeout_seconds=DAV_READINESS_TIMEOUT_SECONDS) as client:
+            self._discover_addressbook(client)
 
     def list_contact_resources(self, *, limit: int) -> tuple[list[ContactResource], bool]:
         with self._http.client() as client:
@@ -503,6 +518,9 @@ class PrivateContactsMCPServer:
         self._contact_reference_ttl_seconds = contact_reference_ttl_seconds
         self._clock = clock
         self._contact_references: dict[str, CachedContact] = {}
+
+    def check_ready(self) -> None:
+        self._contact_source.check_ready()
 
     def handle(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")
@@ -1195,7 +1213,11 @@ def _unique_nonempty(values: Sequence[str]) -> tuple[str, ...]:
 
 def create_app(server: PrivateContactsMCPServer | None = None) -> FastAPI:
     private_contacts = server or PrivateContactsMCPServer()
-    return create_mcp_app(title="Minigent private contacts MCP", handler=private_contacts.handle)
+    return create_mcp_app(
+        title="Minigent private contacts MCP",
+        handler=private_contacts.handle,
+        readiness_check=private_contacts.check_ready,
+    )
 
 
 app = create_app()

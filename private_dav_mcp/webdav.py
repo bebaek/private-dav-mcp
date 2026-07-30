@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 import httpx
 
 DAV_AUTH_MODES = {"auto", "basic", "digest"}
+DAV_READINESS_TIMEOUT_SECONDS = 5.0
 
 
 class DAVHTTPClient:
@@ -40,10 +41,10 @@ class DAVHTTPClient:
         self._not_found_message = not_found_message
         self._transport = transport
 
-    def client(self) -> httpx.Client:
+    def client(self, *, timeout_seconds: float | None = None) -> httpx.Client:
         return httpx.Client(
             verify=self._verify_tls,
-            timeout=self._timeout_seconds,
+            timeout=self._timeout_seconds if timeout_seconds is None else timeout_seconds,
             transport=self._transport,
         )
 

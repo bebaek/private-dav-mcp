@@ -7,6 +7,9 @@ details and DAV wire behavior are outside this contract.
 ## Transport and lifecycle
 
 - Each server exposes stateless JSON-RPC requests at `POST /mcp`.
+- `GET /health/live` reports process liveness without contacting DAV.
+- `GET /health/ready` checks the configured DAV source, caches success and failure for 30 seconds,
+  and returns a non-sensitive `503` response when the source is unavailable.
 - `initialize` returns the negotiated MCP protocol version, server identity, and tool capability.
 - `notifications/initialized` returns HTTP `202` with no JSON body.
 - `tools/list` returns the supported tool descriptors, including JSON input schemas.
