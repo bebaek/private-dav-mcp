@@ -11,6 +11,7 @@ from private_dav_mcp.caldav import (
     Event,
     EventPatch,
     PrivateCalendarMCPServer,
+    apply_event_patch,
     discover_caldav_home_urls,
     parse_caldav_calendars,
     parse_caldav_event_resources,
@@ -199,6 +200,53 @@ def test_serialize_and_patch_icalendar_preserve_unknown_and_recurring_properties
     assert "X-CUSTOM:keep\r\n" in patched
 
 
+def test_patch_timezone_event_times_preserves_tzid_and_timezone_component() -> None:
+    original = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "BEGIN:VTIMEZONE",
+            "TZID:America/New_York",
+            "X-CUSTOM-TIMEZONE:preserve",
+            "END:VTIMEZONE",
+            "BEGIN:VEVENT",
+            "UID:event-id",
+            "DTSTART;TZID=America/New_York:20260301T090000",
+            "DTEND;TZID=America/New_York:20260301T100000",
+            "SUMMARY:Planning",
+            "END:VEVENT",
+            "END:VCALENDAR",
+            "",
+        ]
+    )
+    event = parse_icalendar(original)
+    assert event is not None
+    patch = EventPatch(start="2026-03-01T11:00:00", end="2026-03-01T12:00:00")
+
+    updated = apply_event_patch(event, patch)
+    payload = patch_icalendar(original, updated, patch=patch)
+
+    assert updated.timezone == "America/New_York"
+    assert "DTSTART;TZID=America/New_York:20260301T110000\r\n" in payload
+    assert "DTEND;TZID=America/New_York:20260301T120000\r\n" in payload
+    assert "X-CUSTOM-TIMEZONE:preserve\r\n" in payload
+    assert "DTSTART:20260301T160000Z" not in payload
+
+    with pytest.raises(ValueError, match="requires both start and end"):
+        apply_event_patch(event, EventPatch(start="2026-03-01T13:00:00"))
+    with pytest.raises(ValueError, match="all-day events must not set a timezone"):
+        apply_event_patch(event, EventPatch(start="2026-03-02", end="2026-03-03"))
+
+
+def test_patch_unzoned_event_still_requires_offset_date_times() -> None:
+    event = Event("Planning", "2026-03-01T09:00:00Z", "2026-03-01T10:00:00Z")
+
+    with pytest.raises(ValueError, match="include a UTC offset"):
+        apply_event_patch(
+            event,
+            EventPatch(start="2026-03-01T11:00:00", end="2026-03-01T12:00:00"),
+        )
+
+
 def test_caldav_source_uses_bounded_report_and_etag_writes() -> None:
     requests: list[httpx.Request] = []
     write_status = {"PUT": 201, "DELETE": 204}
@@ -333,6 +381,57 @@ def test_private_calendar_mcp_protects_reads_and_supports_crud() -> None:
 
     deleted = _call(server, "events_delete", {"event_ref": "created-ref"})
     assert deleted["structuredContent"] == {"status": "deleted"}
+
+
+def test_private_calendar_mcp_updates_tzid_event_with_local_times() -> None:
+    references = iter(("calendar-ref", "event-ref", "updated-event-ref"))
+    server = PrivateCalendarMCPServer(
+        events=[
+            Event(
+                "Planning",
+                "2026-03-01T09:00:00",
+                "2026-03-01T10:00:00",
+                timezone="America/New_York",
+            )
+        ],
+        reference_factory=lambda: next(references),
+    )
+    _call(server, "calendars_list", {})
+    listed = _call(
+        server,
+        "events_list",
+        {
+            "calendar_ref": "calendar-ref",
+            "start": "2026-03-01T00:00:00Z",
+            "end": "2026-03-02T00:00:00Z",
+        },
+    )
+    event_ref = listed["structuredContent"]["events"][0]["event_ref"]
+
+    updated = _call(
+        server,
+        "events_update",
+        {
+            "event_ref": event_ref,
+            "start": "2026-03-01T11:00:00",
+            "end": "2026-03-01T12:00:00",
+        },
+    )
+    assert updated["structuredContent"]["status"] == "updated"
+
+    listed_again = _call(
+        server,
+        "events_list",
+        {
+            "calendar_ref": "calendar-ref",
+            "start": "2026-03-01T00:00:00Z",
+            "end": "2026-03-02T00:00:00Z",
+        },
+    )
+    event = listed_again["structuredContent"]["events"][0]
+    assert event["start"] == "2026-03-01T11:00:00"
+    assert event["end"] == "2026-03-01T12:00:00"
+    assert event["timezone"] == "America/New_York"
 
 
 def test_private_calendar_mcp_rejects_unbounded_queries_and_recurring_updates() -> None:

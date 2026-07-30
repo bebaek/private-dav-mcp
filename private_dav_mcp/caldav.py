@@ -176,7 +176,9 @@ EVENTS_UPDATE_TOOL = {
     "name": "events_update",
     "description": (
         "Update selected fields of an event. Omitted fields remain unchanged and an empty "
-        "description, location, or attendee list clears that field. Requires explicit approval."
+        "description, location, or attendee list clears that field. For an event with a timezone, "
+        "change start and end together using local date-times without offsets; its TZID is "
+        "preserved. Requires explicit approval."
     ),
     "inputSchema": {
         "type": "object",
@@ -1028,7 +1030,7 @@ def patch_icalendar(payload: str, event: Event, *, patch: EventPatch) -> str:
 def apply_event_patch(event: Event, patch: EventPatch) -> Event:
     if event.timezone and (patch.start is None) != (patch.end is None):
         raise ValueError("Changing a TZID event requires both start and end")
-    updated_timezone = event.timezone if patch.start is None and patch.end is None else None
+    updated_timezone = event.timezone
     updated = Event(
         summary=event.summary if patch.summary is None else patch.summary,
         start=event.start if patch.start is None else patch.start,
@@ -1078,10 +1080,10 @@ def _event_patch_from_arguments(arguments: dict[str, Any]) -> EventPatch:
         summary=_validate_text(arguments["summary"], field="summary", allow_empty=False)
         if "summary" in arguments
         else None,
-        start=_validate_temporal(arguments["start"], field="start")
+        start=_validate_patch_temporal(arguments["start"], field="start")
         if "start" in arguments
         else None,
-        end=_validate_temporal(arguments["end"], field="end") if "end" in arguments else None,
+        end=_validate_patch_temporal(arguments["end"], field="end") if "end" in arguments else None,
         description=_validate_text(arguments["description"], field="description")
         if "description" in arguments
         else None,
@@ -1098,6 +1100,8 @@ def _validate_event(event: Event) -> None:
     if _event_temporal_kind(event.end, timezone_name=event.timezone, field="end") != start_kind:
         raise ValueError("start and end must both be dates or date-times")
     if start_kind == "date":
+        if event.timezone:
+            raise ValueError("all-day events must not set a timezone")
         if date.fromisoformat(event.end) <= date.fromisoformat(event.start):
             raise ValueError("end must be after start")
     elif _event_datetime(event.end, timezone_name=event.timezone, field="end") <= _event_datetime(
@@ -1130,6 +1134,22 @@ def _validate_temporal(value: Any, *, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a date or RFC 3339 date-time string")
     _temporal_kind(value, field=field)
+    return value
+
+
+def _validate_patch_temporal(value: Any, *, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a date or date-time string")
+    if len(value) == 10:
+        try:
+            date.fromisoformat(value)
+            return value
+        except ValueError:
+            pass
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a date or date-time string") from exc
     return value
 
 
@@ -1212,9 +1232,9 @@ def _event_property_lines(event: Event, *, properties: set[str] | None = None) -
     if "SUMMARY" in selected:
         lines.append(f"SUMMARY:{_escape_ical_text(event.summary)}")
     if "DTSTART" in selected:
-        lines.append(_serialize_temporal("DTSTART", event.start))
+        lines.append(_serialize_temporal("DTSTART", event.start, timezone_name=event.timezone))
     if "DTEND" in selected:
-        lines.append(_serialize_temporal("DTEND", event.end))
+        lines.append(_serialize_temporal("DTEND", event.end, timezone_name=event.timezone))
     if "DESCRIPTION" in selected and event.description:
         lines.append(f"DESCRIPTION:{_escape_ical_text(event.description)}")
     if "LOCATION" in selected and event.location:
@@ -1224,9 +1244,13 @@ def _event_property_lines(event: Event, *, properties: set[str] | None = None) -
     return lines
 
 
-def _serialize_temporal(name: str, value: str) -> str:
-    if _temporal_kind(value, field=name.lower()) == "date":
+def _serialize_temporal(name: str, value: str, *, timezone_name: str | None = None) -> str:
+    kind = _event_temporal_kind(value, timezone_name=timezone_name, field=name.lower())
+    if kind == "date":
         return f"{name};VALUE=DATE:{date.fromisoformat(value).strftime('%Y%m%d')}"
+    if timezone_name:
+        parsed = datetime.fromisoformat(value)
+        return f"{name};TZID={timezone_name}:{parsed.strftime('%Y%m%dT%H%M%S')}"
     parsed = _parse_query_datetime(value, field=name.lower()).astimezone(timezone.utc)
     return f"{name}:{parsed.strftime('%Y%m%dT%H%M%SZ')}"
 

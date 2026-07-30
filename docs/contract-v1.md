@@ -78,7 +78,8 @@ The CalDAV server exposes exactly these v1 tools:
 - `events_delete`
 
 `events_list` requires a bounded date-time range no longer than 366 days and protects summaries.
-`events_get` returns only selected description, location, and attendee fields.
+`events_get` returns only selected description, location, and attendee fields. Updating the time of
+a `TZID` event requires both local start and end values and preserves its timezone definition.
 
 ## Mutation policy
 
