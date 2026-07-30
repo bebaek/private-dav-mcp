@@ -9,6 +9,8 @@ from typing import Any
 import httpx
 import pytest
 
+from private_dav_mcp import __version__
+
 CARDDAV_URL = os.environ.get("PRIVATE_DAV_CARDDAV_CONTRACT_URL", "")
 CALDAV_URL = os.environ.get("PRIVATE_DAV_CALDAV_CONTRACT_URL", "")
 PRIVATE_VALUES_META_KEY = "io.minigent/private-values"
@@ -81,7 +83,7 @@ def _assert_initialize(client: MCPContractClient, *, server_name: str) -> None:
     result = body["result"]
     assert result == {
         "protocolVersion": "2025-11-25",
-        "serverInfo": {"name": server_name, "version": "0.1.0"},
+        "serverInfo": {"name": server_name, "version": __version__},
         "capabilities": {"tools": {}},
     }
 

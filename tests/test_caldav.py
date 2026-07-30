@@ -346,9 +346,15 @@ def test_caldav_source_uses_bounded_report_and_etag_writes() -> None:
     busy_events, busy_truncated = source.list_busy_events(
         calendars[0], start=start, end=end, limit=10
     )
-    expanded_report = requests[-1]
+    query_report, expanded_report = requests[-2:]
     assert busy_truncated is False
     assert busy_events[0].summary == "Planning"
+    assert b"calendar-query" in query_report.content
+    assert b"<cal:expand" not in query_report.content
+    assert b"calendar-multiget" in expanded_report.content
+    assert b"<d:href>/dav.php/calendars/user/personal/event.ics</d:href>" in (
+        expanded_report.content
+    )
     assert b"<cal:expand" in expanded_report.content
     assert b' start="20260301T000000Z" end="20260302T000000Z"' in expanded_report.content
 
@@ -375,6 +381,36 @@ def test_caldav_source_uses_bounded_report_and_etag_writes() -> None:
     write_status["DELETE"] = 412
     with pytest.raises(RuntimeError, match="changed"):
         source.delete_event(resource)
+
+
+def test_caldav_source_does_not_expand_unmatched_calendar_objects() -> None:
+    report_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PROPFIND":
+            return _calendar_discovery_response()
+        if request.method == "REPORT":
+            report_requests.append(request)
+            if b"<cal:expand" in request.content:
+                return httpx.Response(500, content=b"unparseable unrelated calendar object")
+            return httpx.Response(
+                207,
+                content=b'<?xml version="1.0"?><d:multistatus xmlns:d="DAV:" />',
+            )
+        raise AssertionError(f"unexpected request: {request.method}")
+
+    source = _source(handler)
+    calendar = source.list_calendars()[0]
+    start = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 3, 2, tzinfo=timezone.utc)
+
+    busy_events, truncated = source.list_busy_events(calendar, start=start, end=end, limit=10)
+
+    assert busy_events == []
+    assert truncated is False
+    assert len(report_requests) == 1
+    assert b"calendar-query" in report_requests[0].content
+    assert b"<cal:expand" not in report_requests[0].content
 
 
 def test_private_calendar_mcp_protects_reads_and_supports_crud() -> None:

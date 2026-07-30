@@ -11,6 +11,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Protocol
 from urllib.parse import quote, urljoin, urlsplit
 from uuid import uuid4
+from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -89,6 +90,21 @@ def _calendar_query_body(start: datetime, end: datetime, *, expand: bool = False
     </cal:comp-filter>
   </cal:filter>
 </cal:calendar-query>
+""".encode()
+
+
+def _calendar_multiget_expand_body(hrefs: Sequence[str], start: datetime, end: datetime) -> bytes:
+    start_value = start.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    end_value = end.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    href_elements = "".join(f"<d:href>{escape(urlsplit(href).path)}</d:href>" for href in hrefs)
+    return f"""<?xml version="1.0" encoding="utf-8" ?>
+<cal:calendar-multiget xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag />
+    <cal:calendar-data><cal:expand start="{start_value}" end="{end_value}" /></cal:calendar-data>
+  </d:prop>
+  {href_elements}
+</cal:calendar-multiget>
 """.encode()
 
 
@@ -516,13 +532,32 @@ class CalDAVCalendarSource:
         with self._http.client() as client:
             _response, auth, home_url = self._discover(client)
             _validate_collection_url(calendar.href, base_url=home_url)
+            query_response = self._http.request(
+                client,
+                "REPORT",
+                calendar.href,
+                auth=auth,
+                headers=xml_headers(),
+                content=_calendar_query_body(start, end),
+            )
+            self._http.check_response_size(query_response.content)
+            resources = parse_caldav_event_resources(
+                query_response.content, calendar_url=calendar.href
+            )
+            if not resources:
+                return [], False
+            hrefs = [resource.href for resource in resources if resource.href is not None]
+            if not hrefs:
+                return [], False
+            for href in hrefs:
+                _validate_resource_url(href, calendar_url=calendar.href)
             response = self._http.request(
                 client,
                 "REPORT",
                 calendar.href,
                 auth=auth,
                 headers=xml_headers(),
-                content=_calendar_query_body(start, end, expand=True),
+                content=_calendar_multiget_expand_body(hrefs, start, end),
             )
         self._http.check_response_size(response.content)
         events = [

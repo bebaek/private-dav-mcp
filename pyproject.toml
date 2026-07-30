@@ -1,6 +1,6 @@
 [project]
 name = "private-dav-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Privacy-preserving CardDAV and CalDAV MCP sidecars"
 requires-python = ">=3.11"
 dependencies = [
