@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import secrets
 import threading
 from collections.abc import Callable
@@ -20,7 +23,7 @@ from private_dav_mcp.caldav import (
     PrivateCalendarMCPServer,
 )
 from private_dav_mcp.gateway_identity import GatewayIdentity
-from private_dav_mcp.gateway_store import AccountStore, GatewayAccount
+from private_dav_mcp.gateway_store import AccountStore, GatewayAccount, PasswordCredential
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 
 CALENDAR_ACCOUNTS_LIST_TOOL = {
@@ -79,6 +82,61 @@ GATEWAY_CALENDAR_TOOLS = [
 ]
 
 
+@dataclass(frozen=True, repr=False)
+class StaticCalendarAccount:
+    account_id: str
+    label: str
+    base_url: str
+    username: str
+    password: str
+    auth_mode: str = "basic"
+    tenant_id: str = "*"
+    user_id: str = "*"
+
+    def for_identity(self, identity: GatewayIdentity) -> GatewayAccount | None:
+        if self.tenant_id not in {"*", identity.tenant_id} or self.user_id not in {
+            "*",
+            identity.user_id,
+        }:
+            return None
+        owner = f"{identity.tenant_id}\0{identity.user_id}\0{self.account_id}".encode()
+        account_ref = "acct_" + base64.urlsafe_b64encode(
+            hashlib.sha256(owner).digest()[:18]
+        ).decode().rstrip("=")
+        revision_payload = json.dumps(
+            {
+                "account_id": self.account_id,
+                "label": self.label,
+                "base_url": self.base_url,
+                "username": self.username,
+                "password": self.password,
+                "auth_mode": self.auth_mode,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        revision = "env:" + hashlib.sha256(revision_payload).hexdigest()
+        return GatewayAccount(
+            account_ref=account_ref,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+            kind="caldav",
+            label=self.label,
+            base_url=self.base_url,
+            credential=PasswordCredential(
+                username=self.username,
+                password=self.password,
+                mode=self.auth_mode,
+            ),
+            status="configured",
+            enabled=True,
+            last_checked_at=None,
+            last_error=None,
+            created_at="env",
+            updated_at=revision,
+        )
+
+
 @dataclass
 class _AccountServer:
     account_ref: str
@@ -99,8 +157,10 @@ class GatewayCalendarMCP:
         store: AccountStore,
         *,
         server_factory: Callable[[GatewayAccount], PrivateCalendarMCPServer] | None = None,
+        static_accounts: tuple[StaticCalendarAccount, ...] = (),
     ) -> None:
         self._store = store
+        self._static_accounts = static_accounts
         self._server_factory = server_factory or _default_server_factory
         self._lock = threading.RLock()
         self._servers: dict[tuple[str, str, str], _AccountServer] = {}
@@ -312,13 +372,28 @@ class GatewayCalendarMCP:
         )
 
     def _enabled_accounts(self, identity: GatewayIdentity) -> list[GatewayAccount]:
-        return [
+        static_accounts = [
             account
-            for account in self._store.list_accounts(identity.tenant_id, identity.user_id, limit=10)
+            for template in self._static_accounts
+            if (account := template.for_identity(identity)) is not None
+        ]
+        dynamic_accounts = [
+            account
+            for account in self._store.list_accounts(
+                identity.tenant_id, identity.user_id, limit=100
+            )
             if account.enabled
+        ]
+        static_refs = {account.account_ref for account in static_accounts}
+        return static_accounts + [
+            account for account in dynamic_accounts if account.account_ref not in static_refs
         ]
 
     def _owned_enabled_account(self, identity: GatewayIdentity, account_ref: str) -> GatewayAccount:
+        for template in self._static_accounts:
+            static_account = template.for_identity(identity)
+            if static_account is not None and static_account.account_ref == account_ref:
+                return static_account
         account = self._store.get_account(identity.tenant_id, identity.user_id, account_ref)
         if account is None or not account.enabled:
             raise PermissionError("Unknown or unavailable account reference")

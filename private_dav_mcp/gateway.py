@@ -5,7 +5,7 @@ import ipaddress
 import json
 import os
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Annotated, Any, Protocol
 from urllib.parse import urlsplit
@@ -19,7 +19,7 @@ from starlette.concurrency import run_in_threadpool
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
-from private_dav_mcp.gateway_mcp import GatewayCalendarMCP
+from private_dav_mcp.gateway_mcp import GatewayCalendarMCP, StaticCalendarAccount
 from private_dav_mcp.gateway_store import (
     AccountCipher,
     AccountStore,
@@ -151,6 +151,75 @@ class AccountPatchInput(BaseModel):
     enabled: bool | None = None
 
 
+def _static_accounts_from_env(env: Mapping[str, str]) -> tuple[StaticCalendarAccount, ...]:
+    raw = env.get("PRIVATE_DAV_GATEWAY_STATIC_CALDAV_ACCOUNTS", "").strip()
+    legacy_url = env.get("PRIVATE_DAV_GATEWAY_CALDAV_URL", "").strip()
+    if raw and legacy_url:
+        raise RuntimeError(
+            "Configure static CalDAV accounts with JSON or legacy variables, not both"
+        )
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Static CalDAV accounts setting must be valid JSON") from exc
+        if not isinstance(parsed, list) or len(parsed) > 20:
+            raise RuntimeError(
+                "Static CalDAV accounts setting must be an array of at most 20 items"
+            )
+        entries = parsed
+    elif legacy_url:
+        entries = [
+            {
+                "id": env.get("PRIVATE_DAV_GATEWAY_CALDAV_ACCOUNT_ID", "primary"),
+                "label": env.get("PRIVATE_DAV_GATEWAY_CALDAV_LABEL", "Personal calendar"),
+                "base_url": legacy_url,
+                "username": env.get("PRIVATE_DAV_GATEWAY_CALDAV_USERNAME", ""),
+                "password": env.get("PRIVATE_DAV_GATEWAY_CALDAV_PASSWORD", ""),
+                "auth_mode": env.get("PRIVATE_DAV_GATEWAY_CALDAV_AUTH_MODE", "basic"),
+                "tenant_id": env.get("PRIVATE_DAV_GATEWAY_CALDAV_TENANT_ID", "*"),
+                "user_id": env.get("PRIVATE_DAV_GATEWAY_CALDAV_USER_ID", "*"),
+            }
+        ]
+    else:
+        return ()
+
+    accounts: list[StaticCalendarAccount] = []
+    identities: set[tuple[str, str, str]] = set()
+    required = ("id", "label", "base_url", "username", "password")
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Static CalDAV account {index} must be an object")
+        if any(not isinstance(entry.get(key), str) or not entry[key] for key in required):
+            raise RuntimeError(f"Static CalDAV account {index} is missing a required string field")
+        auth_mode = entry.get("auth_mode", "basic")
+        tenant_id = entry.get("tenant_id", "*")
+        user_id = entry.get("user_id", "*")
+        if auth_mode not in {"auto", "basic", "digest"}:
+            raise RuntimeError(f"Static CalDAV account {index} has an invalid auth_mode")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise RuntimeError(f"Static CalDAV account {index} has an invalid tenant_id")
+        if not isinstance(user_id, str) or not user_id:
+            raise RuntimeError(f"Static CalDAV account {index} has an invalid user_id")
+        identity = (tenant_id, user_id, entry["id"])
+        if identity in identities:
+            raise RuntimeError(f"Static CalDAV account {index} has a duplicate owner and id")
+        identities.add(identity)
+        accounts.append(
+            StaticCalendarAccount(
+                account_id=entry["id"],
+                label=entry["label"],
+                base_url=entry["base_url"],
+                username=entry["username"],
+                password=entry["password"],
+                auth_mode=auth_mode,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        )
+    return tuple(accounts)
+
+
 @dataclass(frozen=True)
 class GatewaySettings:
     db_path: str
@@ -161,6 +230,7 @@ class GatewaySettings:
     active_encryption_key_version: int
     allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     allowed_host_suffixes: tuple[str, ...]
+    static_accounts: tuple[StaticCalendarAccount, ...]
 
     @classmethod
     def from_env(cls) -> GatewaySettings:
@@ -197,6 +267,7 @@ class GatewaySettings:
             ),
             allowed_networks=allowed_networks,
             allowed_host_suffixes=suffixes,
+            static_accounts=_static_accounts_from_env(os.environ),
         )
 
 
@@ -229,7 +300,13 @@ def create_gateway_app(
         )
     connector = connector or CalDAVAccountConnector()
     url_policy = url_policy or OutboundURLPolicy()
-    calendar_mcp = calendar_mcp or GatewayCalendarMCP(store)
+    static_accounts = settings.static_accounts if settings is not None else ()
+    for static_account in static_accounts:
+        url_policy.validate(static_account.base_url)
+    calendar_mcp = calendar_mcp or GatewayCalendarMCP(
+        store,
+        static_accounts=static_accounts,
+    )
     app = FastAPI(title="Private DAV Gateway", version="1")
 
     @app.exception_handler(GatewayAPIError)

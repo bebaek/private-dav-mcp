@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import stat
 import time
 from pathlib import Path
@@ -20,11 +22,12 @@ from fastapi.testclient import TestClient
 from private_dav_mcp.caldav import Calendar, Event, PrivateCalendarMCPServer
 from private_dav_mcp.gateway import (
     AccountConnectionError,
+    GatewaySettings,
     OutboundURLPolicy,
     create_gateway_app,
 )
-from private_dav_mcp.gateway_identity import IdentityError, IdentityVerifier
-from private_dav_mcp.gateway_mcp import GatewayCalendarMCP
+from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
+from private_dav_mcp.gateway_mcp import GatewayCalendarMCP, StaticCalendarAccount
 from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
 
 ISSUER = "https://minigent.example"
@@ -363,6 +366,111 @@ def test_gateway_enforces_scopes_authentication_and_url_policy(
         "message": "Account URL is not allowed.",
         "fields": {"base_url": "URL is not allowed."},
     }
+
+
+def test_gateway_settings_load_static_caldav_account_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_JWT_ISSUER", ISSUER)
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_JWT_PUBLIC_KEYS", json.dumps({"key-1": "public"}))
+    monkeypatch.setenv(
+        "PRIVATE_DAV_GATEWAY_ENCRYPTION_KEYS",
+        json.dumps({"1": base64.urlsafe_b64encode(b"k" * 32).decode()}),
+    )
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_URL", "https://dav.example/calendars/")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_USERNAME", "calendar-user")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_PASSWORD", "environment-secret")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_LABEL", "Personal")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_USER_ID", "user-a")
+
+    settings = GatewaySettings.from_env()
+
+    assert len(settings.static_accounts) == 1
+    account = settings.static_accounts[0]
+    assert account.account_id == "primary"
+    assert account.user_id == "user-a"
+    assert account.password == "environment-secret"
+    assert "environment-secret" not in repr(account)
+
+
+def test_static_caldav_accounts_are_owner_scoped_without_database_onboarding(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(
+        tmp_path / "static.db",
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    seen_accounts: list[GatewayAccount] = []
+
+    def server_factory(account: GatewayAccount) -> PrivateCalendarMCPServer:
+        seen_accounts.append(account)
+        return PrivateCalendarMCPServer(
+            calendars=[Calendar("Personal", "https://dav.example/personal/")]
+        )
+
+    broker = GatewayCalendarMCP(
+        store,
+        static_accounts=(
+            StaticCalendarAccount(
+                account_id="primary",
+                label="Personal",
+                base_url="https://dav.example/calendars/",
+                username="calendar-user",
+                password="environment-secret",
+                user_id="user-a",
+            ),
+        ),
+        server_factory=server_factory,
+    )
+    owner = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        token_id="owner-token",
+        scopes=frozenset({"dav:calendar:read"}),
+    )
+    other = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-b",
+        token_id="other-token",
+        scopes=frozenset({"dav:calendar:read"}),
+    )
+
+    owner_accounts = broker.handle(
+        owner,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "calendar_accounts_list", "arguments": {}},
+        },
+    )
+    assert owner_accounts is not None
+    account_ref = owner_accounts["result"]["structuredContent"]["accounts"][0]["account_ref"]
+    other_accounts = broker.handle(
+        other,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "calendar_accounts_list", "arguments": {}},
+        },
+    )
+    assert other_accounts is not None
+    assert other_accounts["result"]["structuredContent"]["accounts"] == []
+
+    calendars = broker.handle(
+        owner,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "calendars_list", "arguments": {"account_ref": account_ref}},
+        },
+    )
+    assert calendars is not None
+    assert len(calendars["result"]["structuredContent"]["calendars"]) == 1
+    assert seen_accounts[0].credential.password == "environment-secret"
+    assert store.list_accounts("tenant-a", "user-a", limit=100) == []
 
 
 def test_account_cipher_detects_owner_substitution() -> None:

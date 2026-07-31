@@ -83,7 +83,32 @@ PRIVATE_DAV_GATEWAY_ACTIVE_ENCRYPTION_KEY_VERSION
 Keyrings are JSON objects keyed by version or JWT `kid`. Encryption values are URL-safe base64;
 JWT values are PEM public keys. Optional `PRIVATE_DAV_GATEWAY_ALLOWED_NETWORKS` and
 `PRIVATE_DAV_GATEWAY_ALLOWED_HOST_SUFFIXES` provide administrator-controlled outbound DAV policy.
-Do not put private keys, bearer tokens, or plaintext DAV credentials in these settings.
+Do not put private keys, bearer tokens, or plaintext DAV credentials in the keyring settings.
+
+For deployments that do not need runtime onboarding, configure one or more CalDAV accounts directly
+from a secret-backed environment variable:
+
+```dotenv
+PRIVATE_DAV_GATEWAY_STATIC_CALDAV_ACCOUNTS=[{"id":"primary","label":"Personal","base_url":"https://dav.example/dav.php/calendars/user/","username":"user","password":"secret","auth_mode":"basic","tenant_id":"tenant-a","user_id":"user-a"}]
+```
+
+`tenant_id` and `user_id` default to `"*"`; set exact values when the deployment serves more than
+one identity. Static credentials remain in the process environment and are not written to SQLite.
+Inject this variable from a secret manager rather than committing it. Up to 20 accounts are
+supported. For a single account, these equivalent variables are also accepted:
+
+```text
+PRIVATE_DAV_GATEWAY_CALDAV_URL
+PRIVATE_DAV_GATEWAY_CALDAV_USERNAME
+PRIVATE_DAV_GATEWAY_CALDAV_PASSWORD
+PRIVATE_DAV_GATEWAY_CALDAV_LABEL
+PRIVATE_DAV_GATEWAY_CALDAV_AUTH_MODE
+PRIVATE_DAV_GATEWAY_CALDAV_ACCOUNT_ID
+PRIVATE_DAV_GATEWAY_CALDAV_TENANT_ID
+PRIVATE_DAV_GATEWAY_CALDAV_USER_ID
+```
+
+The JSON form and single-account form are mutually exclusive.
 
 Implemented interfaces:
 
@@ -95,11 +120,13 @@ Implemented interfaces:
 - `GET /health/live`
 - `GET /health/ready`
 
-Credential fields are write-only and account labels, URLs, usernames, and passwords are encrypted
-at rest with a per-account DEK wrapped by the active deployment KEK. Every account and MCP request
-is scoped to the tenant and user from the verified bearer token. Gateway calendar and event
-references are currently account-bound, owner-bound, process-local, and invalidated by account
-updates; durable cross-replica references are a later milestone.
+Credential fields submitted through the management API are write-only and account labels, URLs,
+usernames, and passwords are encrypted at rest with a per-account DEK wrapped by the active
+deployment KEK. Environment-configured accounts remain in the environment and bypass database
+onboarding. Every account and MCP request is scoped to the tenant and user from the verified bearer
+token. Gateway calendar and event references are currently account-bound, owner-bound,
+process-local, and invalidated by account or environment configuration updates; durable
+cross-replica references are a later milestone.
 
 ## CardDAV
 
