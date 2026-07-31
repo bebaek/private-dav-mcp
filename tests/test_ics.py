@@ -59,6 +59,19 @@ END:VCALENDAR
 """
 
 
+ICS_EXPIRED_SECONDLY = b"""BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:expired-pathological-1
+DTSTART:20200101T000000Z
+DTEND:20200101T000001Z
+RRULE:FREQ=SECONDLY;COUNT=100000
+SUMMARY:Expired pathological event
+END:VEVENT
+END:VCALENDAR
+"""
+
+
 def test_ics_subscription_fetches_caches_and_expands_events() -> None:
     requests = 0
 
@@ -196,6 +209,28 @@ def test_ics_subscription_rejects_pathological_recurrence_expansion() -> None:
             end=datetime(2026, 8, 2, tzinfo=timezone.utc),
             limit=20,
         )
+
+
+def test_ics_subscription_ignores_expired_recurrence_when_estimating_expansion() -> None:
+    source = ICSSubscriptionCalendarSource(
+        url="https://calendar.example/public/basic.ics",
+        label="Public events",
+        max_expanded_occurrences=100,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=ICS_EXPIRED_SECONDLY)
+        ),
+    )
+    calendar = source.list_calendars()[0]
+
+    resources, truncated = source.list_event_resources(
+        calendar,
+        start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 8, 2, tzinfo=timezone.utc),
+        limit=20,
+    )
+
+    assert resources == []
+    assert truncated is False
 
 
 def test_ics_subscription_is_read_only_and_bounds_response_size() -> None:

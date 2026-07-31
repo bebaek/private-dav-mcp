@@ -241,54 +241,113 @@ def _validate_expansion_bound(
     calendar: ICalendar, *, start: datetime, end: datetime, max_occurrences: int
 ) -> None:
     """Reject recurrence sets that can exceed the configured bounded expansion."""
-    span_seconds = max(0.0, (end - start).total_seconds())
     estimated = 0
     for component in calendar.walk("VEVENT"):
-        if component.get("RECURRENCE-ID") is not None:
-            estimated += 1
-            if estimated > max_occurrences:
-                raise RuntimeError("ICS subscription recurrence expansion limit exceeded")
-            continue
         rule = component.get("RRULE")
-        if rule is None:
-            estimated += 1
-        else:
-            frequency_values = rule.get("FREQ", [])
-            frequency = str(frequency_values[0]).upper() if frequency_values else ""
-            interval_values = rule.get("INTERVAL", [1])
-            interval = max(1, int(interval_values[0]))
-            unit_seconds = {
-                "SECONDLY": 1.0,
-                "MINUTELY": 60.0,
-                "HOURLY": 3_600.0,
-                "DAILY": 86_400.0,
-                "WEEKLY": 86_400.0,
-                "MONTHLY": 86_400.0,
-                "YEARLY": 86_400.0,
-            }.get(frequency)
-            if unit_seconds is None:
-                raise RuntimeError("ICS subscription uses an unsupported recurrence frequency")
-            occurrences = int(span_seconds / (unit_seconds * interval)) + 2
-            frequency_rank = {
-                "SECONDLY": 0,
-                "MINUTELY": 1,
-                "HOURLY": 2,
-                "DAILY": 3,
-                "WEEKLY": 4,
-                "MONTHLY": 5,
-                "YEARLY": 6,
-            }[frequency]
-            for key, rank in (("BYSECOND", 1), ("BYMINUTE", 2), ("BYHOUR", 3)):
-                values = rule.get(key, [])
-                if values and frequency_rank >= rank:
-                    occurrences *= len(values)
-            count_values = rule.get("COUNT", [])
-            if count_values:
-                occurrences = min(occurrences, int(count_values[0]))
-            estimated += occurrences
-        estimated += _rdate_count(component.get("RDATE"))
+        if rule is None or component.get("RECURRENCE-ID") is not None:
+            continue
+        frequency_values = rule.get("FREQ", [])
+        frequency = str(frequency_values[0]).upper() if frequency_values else ""
+        interval_values = rule.get("INTERVAL", [1])
+        interval = max(1, int(interval_values[0]))
+        estimate_unit_seconds = {
+            "SECONDLY": 1.0,
+            "MINUTELY": 60.0,
+            "HOURLY": 3_600.0,
+            "DAILY": 86_400.0,
+            "WEEKLY": 604_800.0,
+            "MONTHLY": 2_419_200.0,
+            "YEARLY": 31_536_000.0,
+        }.get(frequency)
+        if estimate_unit_seconds is None:
+            raise RuntimeError("ICS subscription uses an unsupported recurrence frequency")
+        window_start, window_end = _recurrence_window(
+            component,
+            rule,
+            start=start,
+            end=end,
+            frequency=frequency,
+            interval=interval,
+        )
+        if window_end <= window_start:
+            continue
+        span_seconds = (window_end - window_start).total_seconds()
+        occurrences = int(span_seconds / (estimate_unit_seconds * interval)) + 2
+        if frequency == "WEEKLY":
+            occurrences *= max(1, len(rule.get("BYDAY", [])))
+        elif frequency == "MONTHLY":
+            occurrences *= max(
+                1,
+                len(rule.get("BYMONTHDAY", [])),
+                len(rule.get("BYDAY", [])) * 5,
+            )
+        elif frequency == "YEARLY":
+            occurrences *= max(
+                1,
+                len(rule.get("BYYEARDAY", [])),
+                len(rule.get("BYMONTHDAY", [])) * max(1, len(rule.get("BYMONTH", []))),
+                len(rule.get("BYDAY", [])) * 53,
+            )
+        frequency_rank = {
+            "SECONDLY": 0,
+            "MINUTELY": 1,
+            "HOURLY": 2,
+            "DAILY": 3,
+            "WEEKLY": 4,
+            "MONTHLY": 5,
+            "YEARLY": 6,
+        }[frequency]
+        for key, rank in (("BYSECOND", 1), ("BYMINUTE", 2), ("BYHOUR", 3)):
+            values = rule.get(key, [])
+            if values and frequency_rank >= rank:
+                occurrences *= len(values)
+        count_values = rule.get("COUNT", [])
+        if count_values:
+            occurrences = min(occurrences, int(count_values[0]))
+        estimated += occurrences + _rdate_count(component.get("RDATE"))
         if estimated > max_occurrences:
             raise RuntimeError("ICS subscription recurrence expansion limit exceeded")
+
+
+def _recurrence_window(
+    component: Any,
+    rule: Any,
+    *,
+    start: datetime,
+    end: datetime,
+    frequency: str,
+    interval: int,
+) -> tuple[datetime, datetime]:
+    series_start = _utc_temporal(component.decoded("DTSTART"))
+    window_start = max(start.astimezone(timezone.utc), series_start)
+    window_end = end.astimezone(timezone.utc)
+    until_values = rule.get("UNTIL", [])
+    if until_values:
+        window_end = min(window_end, _utc_temporal(until_values[0]))
+    count_values = rule.get("COUNT", [])
+    if count_values:
+        end_unit_seconds = {
+            "SECONDLY": 1.0,
+            "MINUTELY": 60.0,
+            "HOURLY": 3_600.0,
+            "DAILY": 86_400.0,
+            "WEEKLY": 604_800.0,
+            "MONTHLY": 2_678_400.0,
+            "YEARLY": 31_622_400.0,
+        }[frequency]
+        count_end = series_start + timedelta(
+            seconds=end_unit_seconds * interval * int(count_values[0])
+        )
+        window_end = min(window_end, count_end)
+    return window_start, window_end
+
+
+def _utc_temporal(value: date | datetime) -> datetime:
+    if not isinstance(value, datetime):
+        return datetime.combine(value, datetime_time.min, timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _rdate_count(value: Any) -> int:
