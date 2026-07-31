@@ -184,8 +184,9 @@ fake calendar. Tools:
 - `events_delete`
 
 The server discovers the current principal and calendar home, requires bounded event queries,
-and rejects ranges over 366 days. `free_busy` expands recurring instances through CalDAV and
-returns only merged UTC intervals, never titles or other event fields. Create uses
+and rejects ranges over 366 days. `free_busy` prefers server-side recurrence expansion and falls
+back to bounded local expansion when a CalDAV server such as Baïkal rejects the expansion REPORT.
+It returns only merged UTC intervals, never titles or other event fields. Create uses
 `If-None-Match: *`; update and delete use `If-Match`. V1 supports explicitly scoped whole-series
 updates to summary, description, location, and attendees, plus whole-series deletion; recurring
 time shifts remain rejected. When changing the time of an event carrying `TZID`, pass both start

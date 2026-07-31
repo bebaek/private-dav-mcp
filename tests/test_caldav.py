@@ -383,6 +383,36 @@ def test_caldav_source_uses_bounded_report_and_etag_writes() -> None:
         source.delete_event(resource)
 
 
+def test_caldav_source_falls_back_to_local_free_busy_expansion() -> None:
+    report_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PROPFIND":
+            return _calendar_discovery_response()
+        if request.method == "REPORT":
+            report_requests.append(request)
+            if b"<cal:expand" in request.content:
+                return httpx.Response(500, content=b"server recurrence expansion failed")
+            return httpx.Response(207, content=_recurring_event_report_payload())
+        raise AssertionError(f"unexpected request: {request.method}")
+
+    source = _source(handler)
+    calendar = source.list_calendars()[0]
+    start = datetime(2026, 3, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 3, 20, tzinfo=timezone.utc)
+
+    busy_events, truncated = source.list_busy_events(calendar, start=start, end=end, limit=10)
+
+    assert truncated is False
+    assert [(event.start, event.end) for event in busy_events] == [
+        ("2026-03-01T09:00:00Z", "2026-03-01T10:00:00Z"),
+        ("2026-03-15T09:00:00Z", "2026-03-15T10:00:00Z"),
+    ]
+    assert len(report_requests) == 2
+    assert b"<cal:expand" not in report_requests[0].content
+    assert b"<cal:expand" in report_requests[1].content
+
+
 def test_caldav_source_does_not_expand_unmatched_calendar_objects() -> None:
     report_requests: list[httpx.Request] = []
 
@@ -740,6 +770,33 @@ def _calendar_discovery_response() -> httpx.Response:
   </d:prop></d:propstat></d:response>
 </d:multistatus>""",
     )
+
+
+def _recurring_event_report_payload() -> bytes:
+    return b"""<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">
+  <d:response><d:href>/dav.php/calendars/user/personal/series.ics</d:href>
+  <d:propstat><d:prop><d:getetag>"v1"</d:getetag><cal:calendar-data><![CDATA[
+BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:series
+DTSTART:20260301T090000Z
+DTEND:20260301T100000Z
+RRULE:FREQ=WEEKLY;COUNT=3
+SUMMARY:Private series
+END:VEVENT
+BEGIN:VEVENT
+UID:series
+RECURRENCE-ID:20260308T090000Z
+DTSTART:20260308T110000Z
+DTEND:20260308T120000Z
+SUMMARY:Private exception
+TRANSP:TRANSPARENT
+END:VEVENT
+END:VCALENDAR
+]]></cal:calendar-data></d:prop></d:propstat></d:response>
+</d:multistatus>"""
 
 
 def _event_report_payload() -> bytes:

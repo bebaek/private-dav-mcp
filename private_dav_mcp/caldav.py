@@ -15,8 +15,10 @@ from xml.sax.saxutils import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+import recurring_ical_events
 import uvicorn
 from fastapi import FastAPI
+from icalendar import Calendar as ICalendar
 
 from private_dav_mcp import __version__
 from private_dav_mcp.mcp_http import create_mcp_app
@@ -551,20 +553,23 @@ class CalDAVCalendarSource:
                 return [], False
             for href in hrefs:
                 _validate_resource_url(href, calendar_url=calendar.href)
-            response = self._http.request(
-                client,
-                "REPORT",
-                calendar.href,
-                auth=auth,
-                headers=xml_headers(),
-                content=_calendar_multiget_expand_body(hrefs, start, end),
-            )
-        self._http.check_response_size(response.content)
-        events = [
-            event
-            for event in parse_caldav_expanded_events(response.content, calendar_url=calendar.href)
-            if not event.transparent and not event.cancelled
-        ]
+            try:
+                response = self._http.request(
+                    client,
+                    "REPORT",
+                    calendar.href,
+                    auth=auth,
+                    headers=xml_headers(),
+                    content=_calendar_multiget_expand_body(hrefs, start, end),
+                )
+                self._http.check_response_size(response.content)
+                events = parse_caldav_expanded_events(response.content, calendar_url=calendar.href)
+            except RuntimeError:
+                events = expand_caldav_event_resources(resources, start=start, end=end)
+        events = sorted(
+            (event for event in events if not event.transparent and not event.cancelled),
+            key=lambda event: _event_bounds_utc(event)[0],
+        )
         return events[:limit], len(events) > limit
 
     def create_event(self, calendar: Calendar, event: Event) -> EventResource:
@@ -1145,6 +1150,31 @@ def parse_caldav_event_resources(payload: bytes, *, calendar_url: str) -> list[E
             )
         )
     return resources
+
+
+def expand_caldav_event_resources(
+    resources: Sequence[EventResource], *, start: datetime, end: datetime
+) -> list[Event]:
+    """Expand bounded CalDAV query results when the server cannot expand them."""
+    events: list[Event] = []
+    for resource in resources:
+        if not resource.raw_icalendar:
+            continue
+        try:
+            calendar = ICalendar.from_ical(resource.raw_icalendar)
+            if not isinstance(calendar, ICalendar):
+                raise ValueError("expected VCALENDAR")
+            components = recurring_ical_events.of(calendar).between(start, end)
+            for component in components:
+                instances = parse_icalendar_instances(
+                    component.to_ical().decode("utf-8", errors="replace")
+                )
+                events.extend(
+                    event for event in instances if _event_overlaps(event, start=start, end=end)
+                )
+        except Exception as exc:
+            raise RuntimeError("CalDAV local recurrence expansion failed") from exc
+    return events
 
 
 def parse_caldav_expanded_events(payload: bytes, *, calendar_url: str) -> list[Event]:
