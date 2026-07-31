@@ -187,8 +187,14 @@ def _event_from_component(component: Any) -> tuple[Event, datetime]:
     raw_start = component.decoded("DTSTART")
     raw_end = component.decoded("DTEND", None)
     duration = component.decoded("DURATION", None)
+    timezone_name: str | None = None
+    dtstart = component.get("DTSTART")
+    if dtstart is not None:
+        raw_timezone = dtstart.params.get("TZID")
+        if raw_timezone:
+            timezone_name = str(raw_timezone)
     all_day = isinstance(raw_start, date) and not isinstance(raw_start, datetime)
-    start, start_sort = _temporal_value(raw_start)
+    start, start_sort = _temporal_value(raw_start, preserve_local=timezone_name is not None)
     if raw_end is None:
         if isinstance(duration, timedelta):
             raw_end = raw_start + duration
@@ -196,13 +202,7 @@ def _event_from_component(component: Any) -> tuple[Event, datetime]:
             raw_end = raw_start + timedelta(days=1)
         else:
             raw_end = raw_start
-    end, _ = _temporal_value(raw_end)
-    timezone_name: str | None = None
-    dtstart = component.get("DTSTART")
-    if dtstart is not None:
-        raw_timezone = dtstart.params.get("TZID")
-        if raw_timezone:
-            timezone_name = str(raw_timezone)
+    end, _ = _temporal_value(raw_end, preserve_local=timezone_name is not None)
     raw_attendees = component.get("ATTENDEE") or []
     if not isinstance(raw_attendees, list):
         raw_attendees = [raw_attendees]
@@ -230,10 +230,11 @@ def _component_text(component: Any, key: str) -> str:
     return "" if value is None else str(value)
 
 
-def _temporal_value(value: Any) -> tuple[str, datetime]:
+def _temporal_value(value: Any, *, preserve_local: bool) -> tuple[str, datetime]:
     if isinstance(value, datetime):
         sortable = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-        return value.isoformat(), sortable.astimezone(timezone.utc)
+        serialized = value.replace(tzinfo=None).isoformat() if preserve_local else value.isoformat()
+        return serialized, sortable.astimezone(timezone.utc)
     if isinstance(value, date):
         return value.isoformat(), datetime.combine(value, datetime_time.min, timezone.utc)
     raise TypeError("Unsupported ICS event date-time")

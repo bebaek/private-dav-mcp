@@ -35,6 +35,13 @@ DTSTAMP:20260701T000000Z
 DTSTART:20260806T120000Z
 SUMMARY:Zero duration informational event
 END:VEVENT
+BEGIN:VEVENT
+UID:timezone-1
+DTSTAMP:20260701T000000Z
+DTSTART;TZID=America/New_York:20260806T090000
+DTEND;TZID=America/New_York:20260806T100000
+SUMMARY:Timezone event
+END:VEVENT
 END:VCALENDAR
 """
 
@@ -68,7 +75,7 @@ def test_ics_subscription_fetches_caches_and_expands_events() -> None:
 
     assert requests == 1
     assert truncated is False
-    assert len(resources) == 5
+    assert len(resources) == 6
     assert [resource.event.summary for resource in resources[:3]] == [
         "Recurring private event",
         "Recurring private event",
@@ -80,6 +87,8 @@ def test_ics_subscription_fetches_caches_and_expands_events() -> None:
     assert resources[3].event.all_day is True
     assert resources[3].event.transparent is True
     assert resources[4].event.start == resources[4].event.end
+    assert resources[5].event.timezone == "America/New_York"
+    assert resources[5].event.start == "2026-08-06T09:00:00"
 
     busy, busy_truncated = source.list_busy_events(
         calendars[0],
@@ -89,7 +98,7 @@ def test_ics_subscription_fetches_caches_and_expands_events() -> None:
     )
     assert requests == 1
     assert busy_truncated is False
-    assert len(busy) == 3
+    assert len(busy) == 4
 
     now[0] = 401.0
     source.check_ready()
