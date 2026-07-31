@@ -337,6 +337,18 @@ def test_gateway_enforces_scopes_authentication_and_url_policy(
     assert (
         client.post("/v1/accounts", headers=read_only, json=_account_payload()).status_code == 403
     )
+    mcp_denied = client.post(
+        "/mcp",
+        headers=read_only,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "calendar_accounts_list", "arguments": {}},
+        },
+    )
+    assert mcp_denied.status_code == 403
+    assert mcp_denied.json()["error"]["code"] == "permission_denied"
 
     restricted_url = _account_payload()
     restricted_url["base_url"] = "https://127.0.0.1/dav.php"

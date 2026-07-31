@@ -308,6 +308,16 @@ def create_gateway_app(
                     "error": {"code": -32600, "message": "Request must be an object"},
                 },
             )
+        if payload.get("method") == "tools/call":
+            params = payload.get("params")
+            tool_name = params.get("name") if isinstance(params, dict) else None
+            if isinstance(tool_name, str):
+                required_scope = (
+                    "dav:calendar:write"
+                    if tool_name in {"events_create", "events_update", "events_delete"}
+                    else "dav:calendar:read"
+                )
+                require_scope(identity, required_scope)
         result = await run_in_threadpool(calendar_mcp.handle, identity, payload)
         if result is None:
             return Response(status_code=202)
