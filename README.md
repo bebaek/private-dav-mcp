@@ -117,10 +117,15 @@ PRIVATE_DAV_GATEWAY_STATIC_ICS_SUBSCRIPTIONS=[{"id":"public-events","label":"Pub
 ```
 
 The gateway fetches each subscription over HTTPS, limits responses to 5 MB, caches parsed feeds for
-five minutes, and expands recurring events within the requested range. Subscription event fields
-use the same private-value envelope as CalDAV. Create, update, and delete operations are rejected as
-read-only. Up to 50 subscriptions are supported; exact tenant and user values are recommended for
-multi-user deployments.
+five minutes, and expands recurring events within the requested range. Expired entries are
+revalidated with `ETag` and `Last-Modified` when the feed supplies them. If refresh fails, the last
+successful copy remains available for up to 24 hours, with refresh retries throttled to once per
+minute. `calendar_accounts_list` reports an initialized feed as `healthy`, `stale`, or `unavailable`;
+a feed is `configured` before its first fetch. Recurrence expansion is rejected before processing
+when its conservative estimate exceeds 10,000 occurrences, and the expanded result is checked
+against the same limit. Subscription event fields use the same private-value envelope as CalDAV.
+Create, update, and delete operations are rejected as read-only. Up to 50 subscriptions are
+supported; exact tenant and user values are recommended for multi-user deployments.
 
 Implemented interfaces:
 

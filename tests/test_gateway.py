@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import jwt
 import pytest
 from cryptography.exceptions import InvalidTag
@@ -27,8 +28,13 @@ from private_dav_mcp.gateway import (
     create_gateway_app,
 )
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
-from private_dav_mcp.gateway_mcp import GatewayCalendarMCP, StaticCalendarAccount
+from private_dav_mcp.gateway_mcp import (
+    GatewayCalendarMCP,
+    StaticCalendarAccount,
+    StaticICSSubscription,
+)
 from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
+from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 
 ISSUER = "https://minigent.example"
 AUDIENCE = "private-dav"
@@ -327,6 +333,65 @@ def test_gateway_mcp_routes_accounts_calendars_and_free_busy_by_owner(
     )
     assert cross_owner["error"]["code"] == -32002
     assert "Private" not in str(cross_owner)
+
+
+def test_gateway_reports_per_feed_ics_health(tmp_path: Path) -> None:
+    now = [100.0]
+    responses = iter(
+        (
+            httpx.Response(200, content=b"BEGIN:VCALENDAR\nVERSION:2.0\nEND:VCALENDAR\n"),
+            httpx.Response(503),
+        )
+    )
+    source = ICSSubscriptionCalendarSource(
+        url="https://calendar.example/public.ics",
+        label="Public feed",
+        cache_ttl_seconds=300,
+        stale_if_error_seconds=600,
+        clock=lambda: now[0],
+        transport=httpx.MockTransport(lambda _request: next(responses)),
+    )
+    store = AccountStore(
+        tmp_path / "health.db",
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    calendar_gateway = GatewayCalendarMCP(
+        store,
+        static_accounts=(
+            StaticICSSubscription(
+                subscription_id="public",
+                label="Public feed",
+                url="https://calendar.example/public.ics",
+            ),
+        ),
+        server_factory=lambda _account: PrivateCalendarMCPServer(calendar_source=source),
+    )
+    identity = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        scopes=frozenset({"dav:calendar:read"}),
+        token_id="token-a",
+    )
+
+    def call(name: str) -> dict[str, Any]:
+        response = calendar_gateway.handle(
+            identity,
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": {}},
+            },
+        )
+        assert response is not None and "error" not in response
+        return response["result"]["structuredContent"]
+
+    call("calendars_list")
+    assert call("calendar_accounts_list")["accounts"][0]["status"] == "healthy"
+
+    now[0] = 401.0
+    call("calendars_list")
+    assert call("calendar_accounts_list")["accounts"][0]["status"] == "stale"
 
 
 def test_gateway_enforces_scopes_authentication_and_url_policy(

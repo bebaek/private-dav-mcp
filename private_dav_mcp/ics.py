@@ -15,8 +15,10 @@ from icalendar import Calendar as ICalendar
 from private_dav_mcp.caldav import Calendar, Event, EventPatch, EventResource
 
 DEFAULT_ICS_CACHE_TTL_SECONDS = 300.0
+DEFAULT_ICS_STALE_IF_ERROR_SECONDS = 86_400.0
 DEFAULT_ICS_TIMEOUT_SECONDS = 15.0
 MAX_ICS_RESPONSE_BYTES = 5_000_000
+MAX_ICS_EXPANDED_OCCURRENCES = 10_000
 
 
 class ICSSubscriptionCalendarSource:
@@ -26,23 +28,40 @@ class ICSSubscriptionCalendarSource:
         url: str,
         label: str,
         cache_ttl_seconds: float = DEFAULT_ICS_CACHE_TTL_SECONDS,
+        stale_if_error_seconds: float = DEFAULT_ICS_STALE_IF_ERROR_SECONDS,
         timeout_seconds: float = DEFAULT_ICS_TIMEOUT_SECONDS,
         max_response_bytes: int = MAX_ICS_RESPONSE_BYTES,
+        max_expanded_occurrences: int = MAX_ICS_EXPANDED_OCCURRENCES,
         clock: Callable[[], float] = time.monotonic,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        if cache_ttl_seconds <= 0 or timeout_seconds <= 0 or max_response_bytes <= 0:
-            raise ValueError("ICS subscription cache, timeout, and response limit must be positive")
+        if (
+            cache_ttl_seconds <= 0
+            or stale_if_error_seconds < cache_ttl_seconds
+            or timeout_seconds <= 0
+            or max_response_bytes <= 0
+            or max_expanded_occurrences <= 0
+        ):
+            raise ValueError(
+                "ICS subscription cache, stale window, timeout, response limit, and expansion "
+                "limit are invalid"
+            )
         self._url = url
         self._label = label
         self._cache_ttl = cache_ttl_seconds
+        self._stale_if_error = stale_if_error_seconds
         self._timeout = timeout_seconds
         self._max_response_bytes = max_response_bytes
+        self._max_expanded_occurrences = max_expanded_occurrences
         self._clock = clock
         self._transport = transport
         self._lock = threading.RLock()
         self._cached_calendar: ICalendar | None = None
         self._cached_at = 0.0
+        self._refresh_after = 0.0
+        self._etag: str | None = None
+        self._last_modified: str | None = None
+        self._health = "configured"
         digest = hashlib.sha256(url.encode()).hexdigest()[:24]
         self._calendar = Calendar(name=label, href=f"ics-subscription://{digest}/")
 
@@ -61,7 +80,17 @@ class ICSSubscriptionCalendarSource:
         self._require_calendar(calendar)
         parsed = self._load_calendar()
         try:
+            _validate_expansion_bound(
+                parsed,
+                start=start,
+                end=end,
+                max_occurrences=self._max_expanded_occurrences,
+            )
             components = recurring_ical_events.of(parsed).between(start, end)
+            if len(components) > self._max_expanded_occurrences:
+                raise RuntimeError("ICS subscription recurrence expansion limit exceeded")
+        except RuntimeError:
+            raise
         except Exception as exc:
             raise RuntimeError("ICS subscription recurrence expansion failed") from exc
         resources_with_start: list[tuple[datetime, EventResource]] = []
@@ -130,6 +159,10 @@ class ICSSubscriptionCalendarSource:
     def check_ready(self) -> None:
         self._load_calendar()
 
+    def health_status(self) -> str:
+        with self._lock:
+            return self._health
+
     def _require_calendar(self, calendar: Calendar) -> None:
         if calendar.href != self._calendar.href:
             raise PermissionError("Unknown calendar")
@@ -137,17 +170,62 @@ class ICSSubscriptionCalendarSource:
     def _load_calendar(self) -> ICalendar:
         now = self._clock()
         with self._lock:
-            if self._cached_calendar is not None and now - self._cached_at < self._cache_ttl:
+            if (
+                self._cached_calendar is not None
+                and now < self._refresh_after
+                and (self._health != "stale" or now - self._cached_at <= self._stale_if_error)
+            ):
                 return self._cached_calendar
+            headers = {"Accept": "text/calendar"}
+            if self._etag:
+                headers["If-None-Match"] = self._etag
+            if self._last_modified:
+                headers["If-Modified-Since"] = self._last_modified
+            try:
+                content, response_headers, not_modified = self._fetch(headers)
+                if not_modified:
+                    if self._cached_calendar is None:
+                        raise RuntimeError(
+                            "ICS subscription returned not-modified without cached data"
+                        )
+                    parsed = self._cached_calendar
+                else:
+                    try:
+                        parsed = ICalendar.from_ical(content.decode("utf-8-sig"))
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "ICS subscription returned invalid calendar data"
+                        ) from exc
+                    if not isinstance(parsed, ICalendar):
+                        raise RuntimeError("ICS subscription returned invalid calendar data")
+                    self._etag = response_headers.get("etag")
+                    self._last_modified = response_headers.get("last-modified")
+            except RuntimeError:
+                if (
+                    self._cached_calendar is not None
+                    and now - self._cached_at <= self._stale_if_error
+                ):
+                    self._health = "stale"
+                    self._refresh_after = now + min(self._cache_ttl, 60.0)
+                    return self._cached_calendar
+                self._health = "unavailable"
+                raise
+            self._cached_calendar = parsed
+            self._cached_at = now
+            self._refresh_after = now + self._cache_ttl
+            self._health = "healthy"
+            return parsed
+
+    def _fetch(self, headers: dict[str, str]) -> tuple[bytes, httpx.Headers, bool]:
         with httpx.Client(
             timeout=self._timeout,
             follow_redirects=False,
             transport=self._transport,
         ) as client:
             try:
-                with client.stream(
-                    "GET", self._url, headers={"Accept": "text/calendar"}
-                ) as response:
+                with client.stream("GET", self._url, headers=headers) as response:
+                    if response.status_code == 304:
+                        return b"", response.headers, True
                     response.raise_for_status()
                     content = bytearray()
                     for chunk in response.iter_bytes():
@@ -156,16 +234,68 @@ class ICSSubscriptionCalendarSource:
                             raise RuntimeError("ICS subscription response is too large")
             except httpx.HTTPError as exc:
                 raise RuntimeError("ICS subscription fetch failed") from exc
-        try:
-            parsed = ICalendar.from_ical(bytes(content).decode("utf-8-sig"))
-        except Exception as exc:
-            raise RuntimeError("ICS subscription returned invalid calendar data") from exc
-        if not isinstance(parsed, ICalendar):
-            raise RuntimeError("ICS subscription returned invalid calendar data")
-        with self._lock:
-            self._cached_calendar = parsed
-            self._cached_at = now
-        return parsed
+        return bytes(content), response.headers, False
+
+
+def _validate_expansion_bound(
+    calendar: ICalendar, *, start: datetime, end: datetime, max_occurrences: int
+) -> None:
+    """Reject recurrence sets that can exceed the configured bounded expansion."""
+    span_seconds = max(0.0, (end - start).total_seconds())
+    estimated = 0
+    for component in calendar.walk("VEVENT"):
+        if component.get("RECURRENCE-ID") is not None:
+            estimated += 1
+            if estimated > max_occurrences:
+                raise RuntimeError("ICS subscription recurrence expansion limit exceeded")
+            continue
+        rule = component.get("RRULE")
+        if rule is None:
+            estimated += 1
+        else:
+            frequency_values = rule.get("FREQ", [])
+            frequency = str(frequency_values[0]).upper() if frequency_values else ""
+            interval_values = rule.get("INTERVAL", [1])
+            interval = max(1, int(interval_values[0]))
+            unit_seconds = {
+                "SECONDLY": 1.0,
+                "MINUTELY": 60.0,
+                "HOURLY": 3_600.0,
+                "DAILY": 86_400.0,
+                "WEEKLY": 86_400.0,
+                "MONTHLY": 86_400.0,
+                "YEARLY": 86_400.0,
+            }.get(frequency)
+            if unit_seconds is None:
+                raise RuntimeError("ICS subscription uses an unsupported recurrence frequency")
+            occurrences = int(span_seconds / (unit_seconds * interval)) + 2
+            frequency_rank = {
+                "SECONDLY": 0,
+                "MINUTELY": 1,
+                "HOURLY": 2,
+                "DAILY": 3,
+                "WEEKLY": 4,
+                "MONTHLY": 5,
+                "YEARLY": 6,
+            }[frequency]
+            for key, rank in (("BYSECOND", 1), ("BYMINUTE", 2), ("BYHOUR", 3)):
+                values = rule.get(key, [])
+                if values and frequency_rank >= rank:
+                    occurrences *= len(values)
+            count_values = rule.get("COUNT", [])
+            if count_values:
+                occurrences = min(occurrences, int(count_values[0]))
+            estimated += occurrences
+        estimated += _rdate_count(component.get("RDATE"))
+        if estimated > max_occurrences:
+            raise RuntimeError("ICS subscription recurrence expansion limit exceeded")
+
+
+def _rdate_count(value: Any) -> int:
+    if value is None:
+        return 0
+    values = value if isinstance(value, list) else [value]
+    return sum(len(getattr(item, "dts", ())) for item in values)
 
 
 def _has_positive_duration(event: Event) -> bool:

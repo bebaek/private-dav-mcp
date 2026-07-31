@@ -707,6 +707,13 @@ class PrivateCalendarMCPServer:
     def check_ready(self) -> None:
         self._source.check_ready()
 
+    def source_health_status(self) -> str:
+        health_status = getattr(self._source, "health_status", None)
+        if not callable(health_status):
+            return "configured"
+        status = health_status()
+        return status if isinstance(status, str) else "configured"
+
     def handle(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")
         method = payload.get("method")

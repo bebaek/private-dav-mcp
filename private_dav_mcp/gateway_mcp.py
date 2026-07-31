@@ -312,11 +312,21 @@ class GatewayCalendarMCP:
         for account in self._enabled_accounts(identity):
             private_ref = secrets.token_urlsafe(16)
             private_values[private_ref] = account.label
+            status = account.status
+            if account.kind == "ics":
+                key = (account.tenant_id, account.user_id, account.account_ref)
+                with self._lock:
+                    cached_server = self._servers.get(key)
+                if (
+                    cached_server is not None
+                    and cached_server.account_updated_at == account.updated_at
+                ):
+                    status = cached_server.server.source_health_status()
             accounts.append(
                 {
                     "account_ref": account.account_ref,
                     "label": f"{{{{pii:account:{private_ref}}}}}",
-                    "status": account.status,
+                    "status": status,
                 }
             )
         return _private_result(
