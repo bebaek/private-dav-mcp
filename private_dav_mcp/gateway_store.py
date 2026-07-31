@@ -527,6 +527,33 @@ class AccountStore:
             )
             connection.commit()
 
+    def rotate_references_to_active_key(self) -> int:
+        rotated = 0
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM dav_references WHERE key_version != ?",
+                (self._cipher.active_version,),
+            ).fetchall()
+            for row in rows:
+                payload = self._decode_reference_payload(row)
+                aad = _reference_aad(
+                    str(row["tenant_id"]),
+                    str(row["user_id"]),
+                    str(row["account_ref"]),
+                    str(row["account_updated_at"]),
+                    str(row["reference_type"]),
+                    str(row["token_hash"]),
+                )
+                key_version, payload_cipher = self._cipher.encrypt_reference(payload, aad=aad)
+                connection.execute(
+                    "UPDATE dav_references SET key_version = ?, payload_cipher = ? WHERE token_hash = ?",
+                    (key_version, payload_cipher, str(row["token_hash"])),
+                )
+                rotated += 1
+            connection.commit()
+        return rotated
+
     def _decode_reference(self, reference: str, row: sqlite3.Row) -> StoredReference:
         payload = self._decode_reference_payload(row)
         decoded = json.loads(payload)

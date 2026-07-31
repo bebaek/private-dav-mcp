@@ -876,6 +876,27 @@ def test_durable_references_resolve_across_gateway_instances(tmp_path: Path) -> 
         assert b"Durable event" not in content
         assert b"Cross-instance details" not in content
 
+    rotating_store = AccountStore(
+        database,
+        cipher=AccountCipher(keyring={1: b"k" * 32, 2: b"n" * 32}, active_version=2),
+    )
+    assert rotating_store.rotate_references_to_active_key() == 3
+    with sqlite3.connect(database) as connection:
+        assert {
+            row[0] for row in connection.execute("SELECT DISTINCT key_version FROM dav_references")
+        } == {2}
+    new_only_store = AccountStore(
+        database,
+        cipher=AccountCipher(keyring={2: b"n" * 32}, active_version=2),
+    )
+    assert new_only_store.list_references(identity.tenant_id, identity.user_id, "contacts")
+    old_only_store = AccountStore(
+        database,
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    with pytest.raises(RuntimeError, match="key version is unavailable"):
+        old_only_store.list_references(identity.tenant_id, identity.user_id, "contacts")
+
 
 def test_account_cipher_detects_owner_substitution() -> None:
     cipher = AccountCipher(keyring={1: b"x" * 32}, active_version=1)
