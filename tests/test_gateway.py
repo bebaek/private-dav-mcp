@@ -379,7 +379,7 @@ def test_gateway_contacts_mcp_requires_identity_scopes_and_protects_values(
         headers=_headers(private_pem, scopes="dav:calendar:read"),
         json={
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 4,
             "method": "tools/call",
             "params": {"name": "contacts_list", "arguments": {}},
         },
@@ -656,11 +656,25 @@ def test_static_carddav_account_is_authenticated_and_owner_scoped() -> None:
     contact_ref = listed["result"]["structuredContent"]["contacts"][0]["contact_ref"]
     assert "Private Person" not in json.dumps(listed["result"]["structuredContent"])
 
+    catalog = broker.handle(
+        other,
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    )
+    assert catalog is not None
+    assert [tool["name"] for tool in catalog["result"]["tools"]] == [
+        "contacts_list",
+        "contacts_get",
+        "contacts_create",
+        "contacts_update",
+        "contacts_delete",
+        "contacts_protect_text",
+    ]
+
     cross_owner = broker.handle(
         other,
         {
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 3,
             "method": "tools/call",
             "params": {
                 "name": "contacts_get",
@@ -675,7 +689,7 @@ def test_static_carddav_account_is_authenticated_and_owner_scoped() -> None:
         owner,
         {
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": 4,
             "method": "tools/call",
             "params": {"name": "contacts_create", "arguments": {"name": "New Person"}},
         },

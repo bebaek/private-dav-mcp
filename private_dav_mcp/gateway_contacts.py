@@ -7,8 +7,19 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from private_dav_mcp.carddav import CardDAVContactSource, PrivateContactsMCPServer
+from private_dav_mcp import __version__
+from private_dav_mcp.carddav import (
+    CONTACTS_CREATE_TOOL,
+    CONTACTS_DELETE_TOOL,
+    CONTACTS_GET_TOOL,
+    CONTACTS_LIST_TOOL,
+    CONTACTS_PROTECT_TEXT_TOOL,
+    CONTACTS_UPDATE_TOOL,
+    CardDAVContactSource,
+    PrivateContactsMCPServer,
+)
 from private_dav_mcp.gateway_identity import GatewayIdentity
+from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION
 
 _CONTACT_WRITE_TOOLS = {"contacts_create", "contacts_update", "contacts_delete"}
 _MAX_OWNER_SERVERS = 1_000
@@ -82,6 +93,32 @@ class GatewayContactsMCP:
         method = payload.get("method")
         if method == "notifications/initialized" or request_id is None:
             return None
+        if method == "initialize":
+            return _result(
+                request_id,
+                {
+                    "protocolVersion": DEFAULT_MCP_PROTOCOL_VERSION,
+                    "serverInfo": {
+                        "name": "private-dav-gateway-contacts",
+                        "version": __version__,
+                    },
+                    "capabilities": {"tools": {}},
+                },
+            )
+        if method == "tools/list":
+            return _result(
+                request_id,
+                {
+                    "tools": [
+                        CONTACTS_LIST_TOOL,
+                        CONTACTS_GET_TOOL,
+                        CONTACTS_CREATE_TOOL,
+                        CONTACTS_UPDATE_TOOL,
+                        CONTACTS_DELETE_TOOL,
+                        CONTACTS_PROTECT_TEXT_TOOL,
+                    ]
+                },
+            )
         try:
             if method == "tools/call":
                 params = payload.get("params")
@@ -122,6 +159,10 @@ def _default_server_factory(account: StaticContactAccount) -> PrivateContactsMCP
             auth_mode=account.auth_mode,
         )
     )
+
+
+def _result(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
 def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
