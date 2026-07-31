@@ -393,7 +393,7 @@ def create_gateway_app(
         store,
         static_accounts=static_accounts,
     )
-    contacts_mcp = contacts_mcp or GatewayContactsMCP(static_contact_account)
+    contacts_mcp = contacts_mcp or GatewayContactsMCP(static_contact_account, store=store)
     app = FastAPI(title="Private DAV Gateway", version="1")
 
     @app.exception_handler(GatewayAPIError)

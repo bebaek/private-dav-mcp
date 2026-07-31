@@ -5,7 +5,7 @@ import os
 import secrets
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Protocol
@@ -690,6 +690,7 @@ class PrivateCalendarMCPServer:
         private_reference_factory: Callable[[], str] | None = None,
         reference_ttl_seconds: float = DEFAULT_REFERENCE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        references: MutableMapping[str, CachedReference] | None = None,
     ) -> None:
         if calendar_source is not None and calendars is not None:
             raise ValueError("Provide calendar_source or calendars, not both")
@@ -702,7 +703,9 @@ class PrivateCalendarMCPServer:
         )
         self._ttl = reference_ttl_seconds
         self._clock = clock
-        self._references: dict[str, CachedReference] = {}
+        self._references: MutableMapping[str, CachedReference] = (
+            references if references is not None else {}
+        )
 
     def check_ready(self) -> None:
         self._source.check_ready()

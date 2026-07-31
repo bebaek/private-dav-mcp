@@ -5,10 +5,11 @@ import hashlib
 import json
 import secrets
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, cast
 
 from private_dav_mcp import __version__
 from private_dav_mcp.caldav import (
@@ -19,10 +20,15 @@ from private_dav_mcp.caldav import (
     EVENTS_LIST_TOOL,
     EVENTS_UPDATE_TOOL,
     FREE_BUSY_TOOL,
+    CachedReference,
     CalDAVCalendarSource,
+    Calendar,
+    Event,
+    EventResource,
     PrivateCalendarMCPServer,
 )
 from private_dav_mcp.gateway_identity import GatewayIdentity
+from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountStore, GatewayAccount, PasswordCredential
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
@@ -214,7 +220,7 @@ class GatewayCalendarMCP:
     ) -> None:
         self._store = store
         self._static_accounts = static_accounts
-        self._server_factory = server_factory or _default_server_factory
+        self._server_factory = server_factory
         self._lock = threading.RLock()
         self._servers: dict[tuple[str, str, str], _AccountServer] = {}
         self._routes: dict[tuple[str, str, str], _ReferenceRoute] = {}
@@ -490,7 +496,11 @@ class GatewayCalendarMCP:
             current = _AccountServer(
                 account_ref=account.account_ref,
                 account_updated_at=account.updated_at,
-                server=self._server_factory(account),
+                server=(
+                    self._server_factory(account)
+                    if self._server_factory is not None
+                    else self._default_server(account)
+                ),
             )
             self._servers[key] = current
             return current
@@ -514,8 +524,16 @@ class GatewayCalendarMCP:
     def _resolve_route(
         self, identity: GatewayIdentity, reference: str, reference_type: str
     ) -> tuple[GatewayAccount, _AccountServer]:
-        with self._lock:
-            route = self._routes.get((identity.tenant_id, identity.user_id, reference))
+        stored = self._store.get_reference(identity.tenant_id, identity.user_id, reference)
+        if stored is not None:
+            route = _ReferenceRoute(
+                account_ref=stored.account_ref,
+                account_updated_at=stored.account_updated_at,
+                reference_type=stored.reference_type,
+            )
+        else:
+            with self._lock:
+                route = self._routes.get((identity.tenant_id, identity.user_id, reference))
         if route is None or route.reference_type != reference_type:
             raise PermissionError("Unknown or expired reference")
         account = self._owned_enabled_account(identity, route.account_ref)
@@ -534,6 +552,32 @@ class GatewayCalendarMCP:
             reference = item.get("event_ref") if isinstance(item, dict) else None
             if isinstance(reference, str) and reference:
                 self._record_route(identity, reference, account, "event")
+
+    def _default_server(self, account: GatewayAccount) -> PrivateCalendarMCPServer:
+        references = DurableReferenceCache[CachedReference](
+            self._store,
+            tenant_id=account.tenant_id,
+            user_id=account.user_id,
+            account_ref=account.account_ref,
+            account_updated_at=account.updated_at,
+            encode=_encode_calendar_reference,
+            decode=_decode_calendar_reference,
+            reference_types=frozenset({"calendar", "event"}),
+        )
+        if account.kind == "ics":
+            source = ICSSubscriptionCalendarSource(url=account.base_url, label=account.label)
+        else:
+            source = CalDAVCalendarSource(
+                calendar_url=account.base_url,
+                username=account.credential.username,
+                password=account.credential.password,
+                auth_mode=account.credential.mode,
+            )
+        return PrivateCalendarMCPServer(
+            calendar_source=source,
+            clock=time.time,
+            references=references,
+        )
 
     @staticmethod
     def _delegate(
@@ -569,21 +613,104 @@ class GatewayCalendarMCP:
             target[reference] = value
 
 
-def _default_server_factory(account: GatewayAccount) -> PrivateCalendarMCPServer:
-    if account.kind == "ics":
-        return PrivateCalendarMCPServer(
-            calendar_source=ICSSubscriptionCalendarSource(
-                url=account.base_url,
-                label=account.label,
-            )
-        )
-    source = CalDAVCalendarSource(
-        calendar_url=account.base_url,
-        username=account.credential.username,
-        password=account.credential.password,
-        auth_mode=account.credential.mode,
+def _encode_calendar_reference(value: CachedReference) -> tuple[str, dict[str, object], float]:
+    if isinstance(value.value, Calendar):
+        payload: dict[str, object] = {
+            "name": value.value.name,
+            "href": value.value.href,
+            "color": value.value.color,
+        }
+        return "calendar", payload, value.expires_at
+    resource = value.value
+    event = resource.event
+    payload = {
+        "event": {
+            "summary": event.summary,
+            "start": event.start,
+            "end": event.end,
+            "description": event.description,
+            "location": event.location,
+            "attendees": list(event.attendees),
+            "all_day": event.all_day,
+            "timezone": event.timezone,
+            "recurring": event.recurring,
+            "transparent": event.transparent,
+            "cancelled": event.cancelled,
+        },
+        "calendar_href": resource.calendar_href,
+        "href": resource.href,
+        "etag": resource.etag,
+        "uid": resource.uid,
+        "raw_icalendar": resource.raw_icalendar,
+    }
+    return "event", payload, value.expires_at
+
+
+def _decode_calendar_reference(
+    reference_type: str, payload: dict[str, object], expires_at: float
+) -> CachedReference:
+    if reference_type == "calendar":
+        name = payload.get("name")
+        href = payload.get("href")
+        color = payload.get("color")
+        if (
+            not isinstance(name, str)
+            or not isinstance(href, str)
+            or (color is not None and not isinstance(color, str))
+        ):
+            raise RuntimeError("Stored calendar reference is invalid")
+        return CachedReference(Calendar(name=name, href=href, color=color), expires_at)
+    event_payload = payload.get("event")
+    if reference_type != "event" or not isinstance(event_payload, dict):
+        raise RuntimeError("Stored event reference is invalid")
+    string_fields = {
+        name: event_payload.get(name)
+        for name in ("summary", "start", "end", "description", "location")
+    }
+    attendees = event_payload.get("attendees")
+    bool_fields = {
+        name: event_payload.get(name)
+        for name in ("all_day", "recurring", "transparent", "cancelled")
+    }
+    timezone_value = event_payload.get("timezone")
+    if (
+        any(not isinstance(value, str) for value in string_fields.values())
+        or not isinstance(attendees, list)
+        or not all(isinstance(value, str) for value in attendees)
+        or any(not isinstance(value, bool) for value in bool_fields.values())
+        or (timezone_value is not None and not isinstance(timezone_value, str))
+    ):
+        raise RuntimeError("Stored event reference is invalid")
+    optional = {key: payload.get(key) for key in ("href", "etag", "uid", "raw_icalendar")}
+    calendar_href = payload.get("calendar_href")
+    if not isinstance(calendar_href, str) or any(
+        value is not None and not isinstance(value, str) for value in optional.values()
+    ):
+        raise RuntimeError("Stored event reference is invalid")
+    event = Event(
+        summary=cast(str, string_fields["summary"]),
+        start=cast(str, string_fields["start"]),
+        end=cast(str, string_fields["end"]),
+        description=cast(str, string_fields["description"]),
+        location=cast(str, string_fields["location"]),
+        attendees=tuple(cast(list[str], attendees)),
+        all_day=cast(bool, bool_fields["all_day"]),
+        timezone=cast(str | None, timezone_value),
+        recurring=cast(bool, bool_fields["recurring"]),
+        transparent=cast(bool, bool_fields["transparent"]),
+        cancelled=cast(bool, bool_fields["cancelled"]),
     )
-    return PrivateCalendarMCPServer(calendar_source=source)
+    return CachedReference(
+        EventResource(
+            event=event,
+            calendar_href=calendar_href,
+            href=cast(str | None, optional["href"]),
+            etag=cast(str | None, optional["etag"]),
+            uid=cast(str | None, optional["uid"]),
+            raw_icalendar=cast(str | None, optional["raw_icalendar"]),
+        ),
+        expires_at,
+    )
 
 
 def _extract_result(response: dict[str, Any]) -> dict[str, Any]:

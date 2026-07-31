@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import sqlite3
 import stat
 import time
 from pathlib import Path
@@ -20,21 +21,29 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from fastapi.testclient import TestClient
 
-from private_dav_mcp.caldav import Calendar, Event, PrivateCalendarMCPServer
-from private_dav_mcp.carddav import Contact, PrivateContactsMCPServer
+from private_dav_mcp.caldav import CachedReference, Calendar, Event, PrivateCalendarMCPServer
+from private_dav_mcp.carddav import CachedContact, Contact, PrivateContactsMCPServer
 from private_dav_mcp.gateway import (
     AccountConnectionError,
     GatewaySettings,
     OutboundURLPolicy,
     create_gateway_app,
 )
-from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
+from private_dav_mcp.gateway_contacts import (
+    GatewayContactsMCP,
+    StaticContactAccount,
+    _decode_contact_reference,
+    _encode_contact_reference,
+)
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
 from private_dav_mcp.gateway_mcp import (
     GatewayCalendarMCP,
     StaticCalendarAccount,
     StaticICSSubscription,
+    _decode_calendar_reference,
+    _encode_calendar_reference,
 )
+from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 
@@ -696,6 +705,176 @@ def test_static_carddav_account_is_authenticated_and_owner_scoped() -> None:
     )
     assert denied_write is not None
     assert denied_write["error"]["code"] == -32001
+
+
+def test_durable_references_resolve_across_gateway_instances(tmp_path: Path) -> None:
+    database = tmp_path / "shared-gateway.db"
+
+    def new_store() -> AccountStore:
+        return AccountStore(
+            database,
+            cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+        )
+
+    identity = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        token_id="owner-token",
+        scopes=frozenset({"dav:calendar:read", "dav:calendar:write", "dav:contacts:read"}),
+    )
+    contact_account = StaticContactAccount(
+        account_id="contacts",
+        addressbook_url="https://dav.example/addressbooks/",
+        username="contact-user",
+        password="contact-password",
+        tenant_id=identity.tenant_id,
+        user_id=identity.user_id,
+    )
+
+    def contact_factory(_account: StaticContactAccount) -> PrivateContactsMCPServer:
+        cache = DurableReferenceCache[CachedContact](
+            new_store(),
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+            account_ref=contact_account.account_id,
+            account_updated_at=contact_account.revision,
+            encode=_encode_contact_reference,
+            decode=_decode_contact_reference,
+            reference_types=frozenset({"contact"}),
+        )
+        return PrivateContactsMCPServer(
+            contacts=[Contact("Durable Person", emails=("durable@example.test",))],
+            clock=time.time,
+            contact_references=cache,
+        )
+
+    contacts_a = GatewayContactsMCP(
+        contact_account,
+        store=new_store(),
+        server_factory=contact_factory,
+    )
+    contacts_b = GatewayContactsMCP(
+        contact_account,
+        store=new_store(),
+        server_factory=contact_factory,
+    )
+    listed_contacts = contacts_a.handle(
+        identity,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "contacts_list", "arguments": {}},
+        },
+    )
+    assert listed_contacts is not None and "error" not in listed_contacts
+    contact_ref = listed_contacts["result"]["structuredContent"]["contacts"][0]["contact_ref"]
+    selected_contact = contacts_b.handle(
+        identity,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "contacts_get",
+                "arguments": {"contact_ref": contact_ref, "fields": ["emails"]},
+            },
+        },
+    )
+    assert selected_contact is not None and "error" not in selected_contact
+
+    calendar_template = StaticCalendarAccount(
+        account_id="primary",
+        label="Durable calendar",
+        base_url="https://dav.example/calendars/",
+        username="calendar-user",
+        password="calendar-password",
+        tenant_id=identity.tenant_id,
+        user_id=identity.user_id,
+    )
+
+    def calendar_factory(account: GatewayAccount) -> PrivateCalendarMCPServer:
+        cache = DurableReferenceCache[CachedReference](
+            new_store(),
+            tenant_id=account.tenant_id,
+            user_id=account.user_id,
+            account_ref=account.account_ref,
+            account_updated_at=account.updated_at,
+            encode=_encode_calendar_reference,
+            decode=_decode_calendar_reference,
+            reference_types=frozenset({"calendar", "event"}),
+        )
+        return PrivateCalendarMCPServer(
+            calendars=[Calendar("Durable", "https://dav.example/calendars/durable/")],
+            events=[
+                Event(
+                    "Durable event",
+                    "2026-08-01T14:00:00Z",
+                    "2026-08-01T15:00:00Z",
+                    description="Cross-instance details",
+                )
+            ],
+            clock=time.time,
+            references=cache,
+        )
+
+    calendars_a = GatewayCalendarMCP(
+        new_store(), static_accounts=(calendar_template,), server_factory=calendar_factory
+    )
+    calendars_b = GatewayCalendarMCP(
+        new_store(), static_accounts=(calendar_template,), server_factory=calendar_factory
+    )
+    listed_calendars = calendars_a.handle(
+        identity,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "calendars_list", "arguments": {}},
+        },
+    )
+    assert listed_calendars is not None and "error" not in listed_calendars
+    calendar_ref = listed_calendars["result"]["structuredContent"]["calendars"][0]["calendar_ref"]
+    listed_events = calendars_b.handle(
+        identity,
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "events_list",
+                "arguments": {
+                    "calendar_ref": calendar_ref,
+                    "start": "2026-08-01T00:00:00Z",
+                    "end": "2026-08-02T00:00:00Z",
+                },
+            },
+        },
+    )
+    assert listed_events is not None and "error" not in listed_events
+    event_ref = listed_events["result"]["structuredContent"]["events"][0]["event_ref"]
+    selected_event = calendars_a.handle(
+        identity,
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "events_get",
+                "arguments": {"event_ref": event_ref, "fields": ["description"]},
+            },
+        },
+    )
+    assert selected_event is not None and "error" not in selected_event
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM dav_references").fetchone()[0] == 3
+    for database_file in database.parent.glob("shared-gateway.db*"):
+        content = database_file.read_bytes()
+        assert b"Durable Person" not in content
+        assert b"durable@example.test" not in content
+        assert b"Durable event" not in content
+        assert b"Cross-instance details" not in content
 
 
 def test_account_cipher_detects_owner_substitution() -> None:

@@ -35,9 +35,10 @@ privacy gateway with a management API and MCP interface. See
 [gateway contract v1](docs/gateway-contract-v1.md). The gateway now includes identity-token
 verification, an encrypted SQLite account vault, outbound URL policy, owner-scoped account
 lifecycle endpoints, an authenticated multi-account calendar MCP endpoint, and an authenticated
-static CardDAV compatibility endpoint. Calendar preference routes, API-managed CardDAV accounts,
-and durable cross-replica MCP references remain planned; standalone sidecar executables remain
-available for compatibility.
+static CardDAV compatibility endpoint, plus encrypted owner/account-bound SQLite references that
+survive gateway process replacement and resolve across replicas. Calendar preference routes and
+API-managed CardDAV accounts remain planned; standalone sidecar executables remain available for
+compatibility.
 
 To run that suite locally:
 
@@ -125,10 +126,10 @@ PRIVATE_DAV_GATEWAY_CARDDAV_USER_ID
 
 The contact endpoint is `POST /contacts/mcp`. It requires `dav:contacts:read` for listing,
 selective retrieval, and trusted text protection, and `dav:contacts:write` for create, update, and
-delete. A separate `PrivateContactsMCPServer` is retained per authenticated tenant/user so opaque
-contact references cannot cross owners. The static account defaults to wildcard ownership for
-single-household deployments; exact tenant and user values are required when identities must be
-restricted.
+delete. Contact references are encrypted in the gateway SQLite store, scoped to the authenticated
+owner and static account revision, and survive process replacement. The static account defaults to
+wildcard ownership for single-household deployments; exact tenant and user values are required when
+identities must be restricted.
 
 Public, read-only iCalendar feeds use a separate setting:
 
@@ -162,9 +163,12 @@ Credential fields submitted through the management API are write-only and accoun
 usernames, and passwords are encrypted at rest with a per-account DEK wrapped by the active
 deployment KEK. Environment-configured accounts remain in the environment and bypass database
 onboarding. Every account and MCP request is scoped to the tenant and user from the verified bearer
-token. Gateway calendar and event references are currently account-bound, owner-bound,
-process-local, and invalidated by account or environment configuration updates; durable
-cross-replica references are a later milestone.
+token. Contact, calendar, and event references are encrypted at rest in SQLite; only a SHA-256 hash
+of the opaque token is indexed. References are bound to tenant, user, account, account revision, and
+resource type, expire after their normal TTL, resolve across gateway instances, and are invalidated
+by account or environment configuration updates. This permits replicas that share the same gateway
+SQLite database; deployments must still ensure the underlying volume and all other application
+stores support their chosen replica topology.
 
 ## CardDAV
 

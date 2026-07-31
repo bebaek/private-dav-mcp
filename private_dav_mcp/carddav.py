@@ -6,7 +6,7 @@ import re
 import secrets
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import quote, urljoin, urlsplit
@@ -505,6 +505,7 @@ class PrivateContactsMCPServer:
         contact_reference_factory: Callable[[], str] | None = None,
         contact_reference_ttl_seconds: float = DEFAULT_CONTACT_REFERENCE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        contact_references: MutableMapping[str, CachedContact] | None = None,
     ) -> None:
         if contacts is not None and contact_source is not None:
             raise ValueError("Provide contacts or contact_source, not both")
@@ -518,7 +519,9 @@ class PrivateContactsMCPServer:
         )
         self._contact_reference_ttl_seconds = contact_reference_ttl_seconds
         self._clock = clock
-        self._contact_references: dict[str, CachedContact] = {}
+        self._contact_references: MutableMapping[str, CachedContact] = (
+            contact_references if contact_references is not None else {}
+        )
 
     def check_ready(self) -> None:
         self._contact_source.check_ready()

@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import sqlite3
+import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,18 @@ class GatewayAccount:
     last_error: str | None
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class StoredReference:
+    reference: str
+    tenant_id: str
+    user_id: str
+    account_ref: str
+    account_updated_at: str
+    reference_type: str
+    payload: bytes
+    expires_at: float
 
 
 class AccountCipher:
@@ -92,6 +105,18 @@ class AccountCipher:
             b"private-dav|idempotency|" + value,
             hashlib.sha256,
         ).hexdigest()
+
+    def encrypt_reference(self, value: bytes, *, aad: bytes) -> tuple[int, bytes]:
+        return self._active_version, self._encrypt(
+            self._keyring[self._active_version], value, aad + b"|reference"
+        )
+
+    def decrypt_reference(self, value: bytes, *, key_version: int, aad: bytes) -> bytes:
+        try:
+            key = self._keyring[key_version]
+        except KeyError as exc:
+            raise RuntimeError("Reference encryption key version is unavailable") from exc
+        return self._decrypt(key, value, aad + b"|reference")
 
     @staticmethod
     def decode_keyring(encoded: dict[str, str]) -> dict[int, bytes]:
@@ -248,6 +273,10 @@ class AccountStore:
             )
             if cursor.rowcount != 1:
                 raise LookupError("Account not found")
+            connection.execute(
+                "DELETE FROM dav_references WHERE tenant_id = ? AND user_id = ? AND account_ref = ?",
+                (updated.tenant_id, updated.user_id, updated.account_ref),
+            )
             self._audit(connection, updated, audit_operation, "success")
             connection.commit()
         return updated
@@ -260,6 +289,10 @@ class AccountStore:
                 connection.rollback()
                 return False
             self._audit(connection, account, "account.delete", "success")
+            connection.execute(
+                "DELETE FROM dav_references WHERE tenant_id = ? AND user_id = ? AND account_ref = ?",
+                (tenant_id, user_id, account_ref),
+            )
             connection.execute(
                 "DELETE FROM dav_accounts WHERE account_ref = ? AND tenant_id = ? AND user_id = ?",
                 (account_ref, tenant_id, user_id),
@@ -368,6 +401,167 @@ class AccountStore:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return self._cipher.fingerprint(encoded)
 
+    def put_reference(
+        self,
+        *,
+        reference: str,
+        tenant_id: str,
+        user_id: str,
+        account_ref: str,
+        account_updated_at: str,
+        reference_type: str,
+        payload: bytes,
+        expires_at: float,
+    ) -> None:
+        token_hash = _reference_hash(reference)
+        aad = _reference_aad(
+            tenant_id,
+            user_id,
+            account_ref,
+            account_updated_at,
+            reference_type,
+            token_hash,
+        )
+        key_version, payload_cipher = self._cipher.encrypt_reference(payload, aad=aad)
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM dav_references WHERE expires_at <= ?", (now,))
+            count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM dav_references WHERE tenant_id = ? AND user_id = ?",
+                    (tenant_id, user_id),
+                ).fetchone()[0]
+            )
+            if count >= 10_000:
+                connection.execute(
+                    """
+                    DELETE FROM dav_references WHERE token_hash = (
+                      SELECT token_hash FROM dav_references
+                      WHERE tenant_id = ? AND user_id = ? ORDER BY expires_at, created_at LIMIT 1
+                    )
+                    """,
+                    (tenant_id, user_id),
+                )
+            connection.execute(
+                """
+                INSERT INTO dav_references (
+                  token_hash, tenant_id, user_id, account_ref, account_updated_at,
+                  reference_type, key_version, payload_cipher, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(token_hash) DO UPDATE SET
+                  tenant_id = excluded.tenant_id,
+                  user_id = excluded.user_id,
+                  account_ref = excluded.account_ref,
+                  account_updated_at = excluded.account_updated_at,
+                  reference_type = excluded.reference_type,
+                  key_version = excluded.key_version,
+                  payload_cipher = excluded.payload_cipher,
+                  expires_at = excluded.expires_at,
+                  created_at = excluded.created_at
+                """,
+                (
+                    token_hash,
+                    tenant_id,
+                    user_id,
+                    account_ref,
+                    account_updated_at,
+                    reference_type,
+                    key_version,
+                    payload_cipher,
+                    expires_at,
+                    now,
+                ),
+            )
+            connection.commit()
+
+    def get_reference(self, tenant_id: str, user_id: str, reference: str) -> StoredReference | None:
+        token_hash = _reference_hash(reference)
+        now = time.time()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM dav_references
+                WHERE token_hash = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (token_hash, tenant_id, user_id),
+            ).fetchone()
+            if row is None:
+                return None
+            if float(row["expires_at"]) <= now:
+                connection.execute("DELETE FROM dav_references WHERE token_hash = ?", (token_hash,))
+                connection.commit()
+                return None
+        return self._decode_reference(reference, row)
+
+    def list_references(
+        self, tenant_id: str, user_id: str, account_ref: str
+    ) -> list[StoredReference]:
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("DELETE FROM dav_references WHERE expires_at <= ?", (now,))
+            rows = connection.execute(
+                """
+                SELECT * FROM dav_references
+                WHERE tenant_id = ? AND user_id = ? AND account_ref = ?
+                ORDER BY created_at
+                """,
+                (tenant_id, user_id, account_ref),
+            ).fetchall()
+            connection.commit()
+        references: list[StoredReference] = []
+        for row in rows:
+            payload = self._decode_reference_payload(row)
+            decoded = json.loads(payload)
+            reference = decoded.get("reference")
+            if not isinstance(reference, str) or not reference:
+                raise RuntimeError("Stored reference payload is invalid")
+            references.append(self._stored_reference(reference, row, payload))
+        return references
+
+    def delete_reference(self, tenant_id: str, user_id: str, reference: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "DELETE FROM dav_references WHERE token_hash = ? AND tenant_id = ? AND user_id = ?",
+                (_reference_hash(reference), tenant_id, user_id),
+            )
+            connection.commit()
+
+    def _decode_reference(self, reference: str, row: sqlite3.Row) -> StoredReference:
+        payload = self._decode_reference_payload(row)
+        decoded = json.loads(payload)
+        if decoded.get("reference") != reference:
+            raise RuntimeError("Stored reference token authentication failed")
+        return self._stored_reference(reference, row, payload)
+
+    def _decode_reference_payload(self, row: sqlite3.Row) -> bytes:
+        aad = _reference_aad(
+            str(row["tenant_id"]),
+            str(row["user_id"]),
+            str(row["account_ref"]),
+            str(row["account_updated_at"]),
+            str(row["reference_type"]),
+            str(row["token_hash"]),
+        )
+        return self._cipher.decrypt_reference(
+            bytes(row["payload_cipher"]),
+            key_version=int(row["key_version"]),
+            aad=aad,
+        )
+
+    @staticmethod
+    def _stored_reference(reference: str, row: sqlite3.Row, payload: bytes) -> StoredReference:
+        return StoredReference(
+            reference=reference,
+            tenant_id=str(row["tenant_id"]),
+            user_id=str(row["user_id"]),
+            account_ref=str(row["account_ref"]),
+            account_updated_at=str(row["account_updated_at"]),
+            reference_type=str(row["reference_type"]),
+            payload=payload,
+            expires_at=float(row["expires_at"]),
+        )
+
     @staticmethod
     def _audit(
         connection: sqlite3.Connection,
@@ -438,12 +632,13 @@ class AccountStore:
                   token_hash TEXT PRIMARY KEY,
                   tenant_id TEXT NOT NULL,
                   user_id TEXT NOT NULL,
-                  account_ref TEXT NOT NULL REFERENCES dav_accounts(account_ref) ON DELETE CASCADE,
+                  account_ref TEXT NOT NULL,
+                  account_updated_at TEXT NOT NULL,
                   reference_type TEXT NOT NULL,
-                  resource_cipher BLOB NOT NULL,
-                  etag_cipher BLOB,
-                  expires_at TEXT NOT NULL,
-                  created_at TEXT NOT NULL
+                  key_version INTEGER NOT NULL,
+                  payload_cipher BLOB NOT NULL,
+                  expires_at REAL NOT NULL,
+                  created_at REAL NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS dav_references_owner
                   ON dav_references (tenant_id, user_id, account_ref, reference_type);
@@ -457,13 +652,55 @@ class AccountStore:
                   outcome TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
                 """
             )
+            reference_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(dav_references)")
+            }
+            if "payload_cipher" not in reference_columns:
+                connection.executescript(
+                    """
+                    DROP TABLE dav_references;
+                    CREATE TABLE dav_references (
+                      token_hash TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL,
+                      user_id TEXT NOT NULL,
+                      account_ref TEXT NOT NULL,
+                      account_updated_at TEXT NOT NULL,
+                      reference_type TEXT NOT NULL,
+                      key_version INTEGER NOT NULL,
+                      payload_cipher BLOB NOT NULL,
+                      expires_at REAL NOT NULL,
+                      created_at REAL NOT NULL
+                    );
+                    CREATE INDEX dav_references_owner
+                      ON dav_references (tenant_id, user_id, account_ref, reference_type);
+                    PRAGMA user_version = 2;
+                    """
+                )
 
 
 def _account_aad(tenant_id: str, user_id: str, account_ref: str) -> bytes:
     return f"private-dav|{tenant_id}|{user_id}|{account_ref}".encode()
+
+
+def _reference_hash(reference: str) -> str:
+    return hashlib.sha256(reference.encode()).hexdigest()
+
+
+def _reference_aad(
+    tenant_id: str,
+    user_id: str,
+    account_ref: str,
+    account_updated_at: str,
+    reference_type: str,
+    token_hash: str,
+) -> bytes:
+    return (
+        f"private-dav-reference|{tenant_id}|{user_id}|{account_ref}|{account_updated_at}|"
+        f"{reference_type}|{token_hash}"
+    ).encode()
 
 
 def _utc_now() -> str:
