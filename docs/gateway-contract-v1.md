@@ -57,6 +57,8 @@ correlation but MUST NOT retain the token.
 | `dav:accounts:write` | Add, update, test, disable, or remove accounts through REST |
 | `dav:calendar:read` | Use read-only calendar MCP tools |
 | `dav:calendar:write` | Use event mutation MCP tools |
+| `dav:contacts:read` | Use contact listing, selective retrieval, and trusted protection tools |
+| `dav:contacts:write` | Use contact mutation MCP tools |
 
 `dav:accounts:write` does not imply calendar access, and `dav:calendar:write` does not permit
 credential management.
@@ -421,6 +423,19 @@ The gateway executes a valid authorized mutation but does not replace Minigent's
 approval. Minigent MUST resolve approved private placeholders and obtain approval before invoking a
 mutation. The gateway records a non-sensitive mutation audit event containing owner, account
 record ID, operation, outcome, request correlation ID, and timestamp—never event fields.
+
+### Static CardDAV compatibility endpoint
+
+`POST /contacts/mcp` exposes the contact tools from `docs/contract-v1.md` through the same bearer
+identity verifier. `contacts_list`, `contacts_get`, and `contacts_protect_text` require
+`dav:contacts:read`; `contacts_create`, `contacts_update`, and `contacts_delete` require
+`dav:contacts:write`.
+
+The initial gateway implementation accepts one secret-backed static CardDAV account. It creates an
+independent contact server and opaque-reference namespace for each authenticated tenant/user.
+Cross-owner, unconfigured-owner, and unknown contact references return non-enumerating errors. The
+endpoint preserves private-value envelopes and ETag mutation behavior. API-managed CardDAV account
+onboarding is outside this compatibility milestone.
 
 ## Errors
 

@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
+from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
 from private_dav_mcp.gateway_mcp import (
     GatewayCalendarMCP,
@@ -270,6 +271,32 @@ def _static_ics_subscriptions_from_env(
     return tuple(subscriptions)
 
 
+def _static_contact_account_from_env(env: Mapping[str, str]) -> StaticContactAccount | None:
+    addressbook_url = env.get("PRIVATE_DAV_GATEWAY_CARDDAV_URL", "").strip()
+    if not addressbook_url:
+        return None
+    username = env.get("PRIVATE_DAV_GATEWAY_CARDDAV_USERNAME", "")
+    password = env.get("PRIVATE_DAV_GATEWAY_CARDDAV_PASSWORD", "")
+    auth_mode = env.get("PRIVATE_DAV_GATEWAY_CARDDAV_AUTH_MODE", "auto")
+    tenant_id = env.get("PRIVATE_DAV_GATEWAY_CARDDAV_TENANT_ID", "*")
+    user_id = env.get("PRIVATE_DAV_GATEWAY_CARDDAV_USER_ID", "*")
+    if not username or not password:
+        raise RuntimeError("Static CardDAV account requires username and password")
+    if auth_mode not in {"auto", "basic", "digest"}:
+        raise RuntimeError("Static CardDAV account has an invalid auth mode")
+    if not tenant_id or not user_id:
+        raise RuntimeError("Static CardDAV account has an invalid owner")
+    return StaticContactAccount(
+        account_id=env.get("PRIVATE_DAV_GATEWAY_CARDDAV_ACCOUNT_ID", "contacts"),
+        addressbook_url=addressbook_url,
+        username=username,
+        password=password,
+        auth_mode=auth_mode,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+
+
 @dataclass(frozen=True)
 class GatewaySettings:
     db_path: str
@@ -281,6 +308,7 @@ class GatewaySettings:
     allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     allowed_host_suffixes: tuple[str, ...]
     static_accounts: tuple[StaticGatewayAccount, ...]
+    static_contact_account: StaticContactAccount | None
 
     @classmethod
     def from_env(cls) -> GatewaySettings:
@@ -321,6 +349,7 @@ class GatewaySettings:
                 *_static_accounts_from_env(os.environ),
                 *_static_ics_subscriptions_from_env(os.environ),
             ),
+            static_contact_account=_static_contact_account_from_env(os.environ),
         )
 
 
@@ -331,6 +360,7 @@ def create_gateway_app(
     connector: AccountConnector | None = None,
     url_policy: OutboundURLPolicy | None = None,
     calendar_mcp: GatewayCalendarMCP | None = None,
+    contacts_mcp: GatewayContactsMCP | None = None,
     settings: GatewaySettings | None = None,
 ) -> FastAPI:
     if verifier is None or store is None:
@@ -354,12 +384,16 @@ def create_gateway_app(
     connector = connector or CalDAVAccountConnector()
     url_policy = url_policy or OutboundURLPolicy()
     static_accounts = settings.static_accounts if settings is not None else ()
+    static_contact_account = settings.static_contact_account if settings is not None else None
     for static_account in static_accounts:
         url_policy.validate(static_account.base_url)
+    if static_contact_account is not None:
+        url_policy.validate(static_contact_account.addressbook_url)
     calendar_mcp = calendar_mcp or GatewayCalendarMCP(
         store,
         static_accounts=static_accounts,
     )
+    contacts_mcp = contacts_mcp or GatewayContactsMCP(static_contact_account)
     app = FastAPI(title="Private DAV Gateway", version="1")
 
     @app.exception_handler(GatewayAPIError)
@@ -410,6 +444,7 @@ def create_gateway_app(
         try:
             await run_in_threadpool(store.check_ready)
             await run_in_threadpool(calendar_mcp.check_ready)
+            await run_in_threadpool(contacts_mcp.check_ready)
         except Exception:
             return JSONResponse(status_code=503, content={"status": "not_ready"})
         return JSONResponse(status_code=200, content={"status": "ready"})
@@ -450,6 +485,46 @@ def create_gateway_app(
                 )
                 require_scope(identity, required_scope)
         result = await run_in_threadpool(calendar_mcp.handle, identity, payload)
+        if result is None:
+            return Response(status_code=202)
+        return JSONResponse(status_code=200, content=result)
+
+    @app.post("/contacts/mcp")
+    async def contacts_mcp_endpoint(
+        request: Request,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> Response:
+        try:
+            payload = await request.json()
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Invalid JSON"},
+                },
+            )
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Request must be an object"},
+                },
+            )
+        if payload.get("method") == "tools/call":
+            params = payload.get("params")
+            tool_name = params.get("name") if isinstance(params, dict) else None
+            if isinstance(tool_name, str):
+                required_scope = (
+                    "dav:contacts:write"
+                    if tool_name in {"contacts_create", "contacts_update", "contacts_delete"}
+                    else "dav:contacts:read"
+                )
+                require_scope(identity, required_scope)
+        result = await run_in_threadpool(contacts_mcp.handle, identity, payload)
         if result is None:
             return Response(status_code=202)
         return JSONResponse(status_code=200, content=result)

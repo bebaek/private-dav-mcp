@@ -21,12 +21,14 @@ from cryptography.hazmat.primitives.serialization import (
 from fastapi.testclient import TestClient
 
 from private_dav_mcp.caldav import Calendar, Event, PrivateCalendarMCPServer
+from private_dav_mcp.carddav import Contact, PrivateContactsMCPServer
 from private_dav_mcp.gateway import (
     AccountConnectionError,
     GatewaySettings,
     OutboundURLPolicy,
     create_gateway_app,
 )
+from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
 from private_dav_mcp.gateway_mcp import (
     GatewayCalendarMCP,
@@ -87,12 +89,24 @@ def gateway(
             events=[Event("Private meeting", "2026-08-01T14:00:00Z", "2026-08-01T15:00:00Z")],
         ),
     )
+    contacts_mcp = GatewayContactsMCP(
+        StaticContactAccount(
+            account_id="contacts",
+            addressbook_url="https://dav.example/addressbooks/",
+            username="contacts-user",
+            password="contacts-secret",
+        ),
+        server_factory=lambda _account: PrivateContactsMCPServer(
+            contacts=[Contact("Private Person", emails=("private@example.com",))]
+        ),
+    )
     app = create_gateway_app(
         verifier=verifier,
         store=store,
         connector=connector,
         url_policy=policy,
         calendar_mcp=calendar_mcp,
+        contacts_mcp=contacts_mcp,
     )
     return TestClient(app), private_pem, connector, db_path
 
@@ -102,7 +116,10 @@ def _token(
     *,
     tenant_id: str = "tenant-a",
     user_id: str = "user-a",
-    scopes: str = ("dav:accounts:read dav:accounts:write dav:calendar:read dav:calendar:write"),
+    scopes: str = (
+        "dav:accounts:read dav:accounts:write dav:calendar:read dav:calendar:write "
+        "dav:contacts:read dav:contacts:write"
+    ),
     audience: str = AUDIENCE,
 ) -> str:
     now = int(time.time())
@@ -335,6 +352,42 @@ def test_gateway_mcp_routes_accounts_calendars_and_free_busy_by_owner(
     assert "Private" not in str(cross_owner)
 
 
+def test_gateway_contacts_mcp_requires_identity_scopes_and_protects_values(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, _db_path = gateway
+    response = client.post(
+        "/contacts/mcp",
+        headers=_headers(private_pem),
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "contacts_list", "arguments": {}},
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "error" not in body
+    result = body["result"]
+    assert "Private Person" not in json.dumps(result["structuredContent"])
+    assert set(result["_meta"]["io.minigent/private-values"].values()) == {"Private Person"}
+
+    denied = client.post(
+        "/contacts/mcp",
+        headers=_headers(private_pem, scopes="dav:calendar:read"),
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "contacts_list", "arguments": {}},
+        },
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "permission_denied"
+
+
 def test_gateway_reports_per_feed_ics_health(tmp_path: Path) -> None:
     now = [100.0]
     responses = iter(
@@ -447,6 +500,10 @@ def test_gateway_settings_load_static_caldav_account_from_environment(
     monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_PASSWORD", "environment-secret")
     monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_LABEL", "Personal")
     monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_USER_ID", "user-a")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CARDDAV_URL", "https://dav.example/addressbooks/")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CARDDAV_USERNAME", "contacts-user")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CARDDAV_PASSWORD", "contacts-secret")
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CARDDAV_USER_ID", "user-a")
     monkeypatch.setenv(
         "PRIVATE_DAV_GATEWAY_STATIC_ICS_SUBSCRIPTIONS",
         json.dumps(
@@ -470,6 +527,11 @@ def test_gateway_settings_load_static_caldav_account_from_environment(
     assert account.user_id == "user-a"
     assert account.password == "environment-secret"
     assert settings.static_accounts[1].base_url == "https://calendar.example/public/basic.ics"
+    assert settings.static_contact_account is not None
+    assert settings.static_contact_account.addressbook_url == "https://dav.example/addressbooks/"
+    assert settings.static_contact_account.user_id == "user-a"
+    assert settings.static_contact_account.password == "contacts-secret"
+    assert "contacts-secret" not in repr(settings.static_contact_account)
     assert "environment-secret" not in repr(account)
 
 
@@ -552,6 +614,74 @@ def test_static_caldav_accounts_are_owner_scoped_without_database_onboarding(
     assert len(calendars["result"]["structuredContent"]["calendars"]) == 1
     assert seen_accounts[0].credential.password == "environment-secret"
     assert store.list_accounts("tenant-a", "user-a", limit=100) == []
+
+
+def test_static_carddav_account_is_authenticated_and_owner_scoped() -> None:
+    broker = GatewayContactsMCP(
+        StaticContactAccount(
+            account_id="contacts",
+            addressbook_url="https://dav.example/addressbooks/",
+            username="contacts-user",
+            password="contacts-secret",
+            tenant_id="tenant-a",
+            user_id="user-a",
+        ),
+        server_factory=lambda _account: PrivateContactsMCPServer(
+            contacts=[Contact("Private Person", emails=("private@example.com",))]
+        ),
+    )
+    owner = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        token_id="owner-token",
+        scopes=frozenset({"dav:contacts:read"}),
+    )
+    other = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-b",
+        token_id="other-token",
+        scopes=frozenset({"dav:contacts:read"}),
+    )
+
+    listed = broker.handle(
+        owner,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "contacts_list", "arguments": {}},
+        },
+    )
+    assert listed is not None and "error" not in listed
+    contact_ref = listed["result"]["structuredContent"]["contacts"][0]["contact_ref"]
+    assert "Private Person" not in json.dumps(listed["result"]["structuredContent"])
+
+    cross_owner = broker.handle(
+        other,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "contacts_get",
+                "arguments": {"contact_ref": contact_ref, "fields": ["emails"]},
+            },
+        },
+    )
+    assert cross_owner is not None
+    assert cross_owner["error"]["code"] == -32001
+
+    denied_write = broker.handle(
+        owner,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "contacts_create", "arguments": {"name": "New Person"}},
+        },
+    )
+    assert denied_write is not None
+    assert denied_write["error"]["code"] == -32001
 
 
 def test_account_cipher_detects_owner_substitution() -> None:

@@ -34,9 +34,10 @@ privacy gateway with a management API and MCP interface. See
 [ADR 0001](docs/adr/0001-multitenant-dav-privacy-gateway.md) and the draft
 [gateway contract v1](docs/gateway-contract-v1.md). The gateway now includes identity-token
 verification, an encrypted SQLite account vault, outbound URL policy, owner-scoped account
-lifecycle endpoints, and an authenticated multi-account calendar MCP endpoint. Calendar preference
-routes and durable cross-replica MCP references remain planned; the gateway does not replace the
-current executable sidecar contract yet.
+lifecycle endpoints, an authenticated multi-account calendar MCP endpoint, and an authenticated
+static CardDAV compatibility endpoint. Calendar preference routes, API-managed CardDAV accounts,
+and durable cross-replica MCP references remain planned; standalone sidecar executables remain
+available for compatibility.
 
 To run that suite locally:
 
@@ -110,6 +111,25 @@ PRIVATE_DAV_GATEWAY_CALDAV_USER_ID
 
 The JSON form and single-account form are mutually exclusive.
 
+A static CardDAV address book can use the same authenticated gateway process:
+
+```text
+PRIVATE_DAV_GATEWAY_CARDDAV_URL
+PRIVATE_DAV_GATEWAY_CARDDAV_USERNAME
+PRIVATE_DAV_GATEWAY_CARDDAV_PASSWORD
+PRIVATE_DAV_GATEWAY_CARDDAV_AUTH_MODE
+PRIVATE_DAV_GATEWAY_CARDDAV_ACCOUNT_ID
+PRIVATE_DAV_GATEWAY_CARDDAV_TENANT_ID
+PRIVATE_DAV_GATEWAY_CARDDAV_USER_ID
+```
+
+The contact endpoint is `POST /contacts/mcp`. It requires `dav:contacts:read` for listing,
+selective retrieval, and trusted text protection, and `dav:contacts:write` for create, update, and
+delete. A separate `PrivateContactsMCPServer` is retained per authenticated tenant/user so opaque
+contact references cannot cross owners. The static account defaults to wildcard ownership for
+single-household deployments; exact tenant and user values are required when identities must be
+restricted.
+
 Public, read-only iCalendar feeds use a separate setting:
 
 ```dotenv
@@ -134,6 +154,7 @@ Implemented interfaces:
 - `POST /v1/accounts/{account_ref}/test`
 - `POST /mcp` with `calendar_accounts_list`, `calendars_list`, event tools, and multi-calendar
   `free_busy`
+- `POST /contacts/mcp` with authenticated contact read, protection, and mutation tools
 - `GET /health/live`
 - `GET /health/ready`
 
