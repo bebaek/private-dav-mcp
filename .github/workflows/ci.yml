@@ -80,20 +80,77 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: HIGH,CRITICAL
-      - name: Start CardDAV and CalDAV servers
+      - name: Start CardDAV, CalDAV, and authenticated gateway servers
         run: |
+          mkdir -p .contract-certs
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout .contract-certs/tls-key.pem \
+            -out .contract-certs/ca.crt \
+            -days 1 \
+            -subj '/CN=contract-dav.test' \
+            -addext 'subjectAltName=DNS:contract-dav.test'
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+            -out .contract-certs/jwt-private.pem
+          openssl pkey -in .contract-certs/jwt-private.pem -pubout \
+            -out .contract-certs/jwt-public.pem
+          uv run --no-sync python scripts/contract_dav_server.py \
+            --cert .contract-certs/ca.crt \
+            --key .contract-certs/tls-key.pem \
+            >.contract-dav.log 2>&1 &
+          echo $! > .contract-dav.pid
+          for attempt in $(seq 1 30); do
+            if curl --noproxy '*' --cacert .contract-certs/ca.crt --fail --silent --show-error \
+              --resolve contract-dav.test:19443:127.0.0.1 \
+              https://contract-dav.test:19443/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              cat .contract-dav.log
+              exit 1
+            fi
+            sleep 1
+          done
+          JWT_PUBLIC_KEYS="$(python -c 'import json; print(json.dumps({"contract-key": open(".contract-certs/jwt-public.pem").read()}))')"
+          ENCRYPTION_KEYS="$(python -c 'import base64,json; print(json.dumps({"1": base64.b64encode(b"k" * 32).decode()}))')"
           docker run --detach --name private-dav-carddav-contract --publish 18767:8767 \
             private-dav-mcp:contract \
             private-dav-carddav-mcp --host 0.0.0.0 --port 8767
           docker run --detach --name private-dav-caldav-contract --publish 18768:8768 \
             private-dav-mcp:contract \
             private-dav-caldav-mcp --host 0.0.0.0 --port 8768
+          docker run --detach --name private-dav-gateway-contract --publish 18769:8769 \
+            --add-host contract-dav.test:host-gateway \
+            --volume "$PWD/.contract-certs/ca.crt:/certs/ca.crt:ro" \
+            --env SSL_CERT_FILE=/certs/ca.crt \
+            --env PRIVATE_DAV_GATEWAY_DB_PATH=/tmp/private-dav-gateway.db \
+            --env PRIVATE_DAV_GATEWAY_JWT_ISSUER=https://contract-issuer.example \
+            --env PRIVATE_DAV_GATEWAY_JWT_AUDIENCE=private-dav-contract \
+            --env "PRIVATE_DAV_GATEWAY_JWT_PUBLIC_KEYS=$JWT_PUBLIC_KEYS" \
+            --env "PRIVATE_DAV_GATEWAY_ENCRYPTION_KEYS=$ENCRYPTION_KEYS" \
+            --env PRIVATE_DAV_GATEWAY_ALLOWED_NETWORKS=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,fc00::/7 \
+            --env PRIVATE_DAV_GATEWAY_ALLOWED_HOST_SUFFIXES=contract-dav.test \
+            --env PRIVATE_DAV_GATEWAY_CARDDAV_URL=https://contract-dav.test:19443/carddav/ \
+            --env PRIVATE_DAV_GATEWAY_CARDDAV_USERNAME=contract-user \
+            --env PRIVATE_DAV_GATEWAY_CARDDAV_PASSWORD=contract-password \
+            --env PRIVATE_DAV_GATEWAY_CARDDAV_AUTH_MODE=basic \
+            --env PRIVATE_DAV_GATEWAY_CARDDAV_TENANT_ID=contract-tenant \
+            --env PRIVATE_DAV_GATEWAY_CARDDAV_USER_ID=contract-user \
+            --env PRIVATE_DAV_GATEWAY_CALDAV_URL=https://contract-dav.test:19443/caldav/ \
+            --env PRIVATE_DAV_GATEWAY_CALDAV_USERNAME=contract-user \
+            --env PRIVATE_DAV_GATEWAY_CALDAV_PASSWORD=contract-password \
+            --env PRIVATE_DAV_GATEWAY_CALDAV_AUTH_MODE=basic \
+            --env PRIVATE_DAV_GATEWAY_CALDAV_LABEL='Contract CalDAV' \
+            --env PRIVATE_DAV_GATEWAY_CALDAV_TENANT_ID=contract-tenant \
+            --env PRIVATE_DAV_GATEWAY_CALDAV_USER_ID=contract-user \
+            --env 'PRIVATE_DAV_GATEWAY_STATIC_ICS_SUBSCRIPTIONS=[{"id":"contract-ics","label":"Contract ICS","url":"https://contract-dav.test:19443/feed.ics","tenant_id":"contract-tenant","user_id":"contract-user"}]' \
+            private-dav-mcp:contract \
+            private-dav-gateway --host 0.0.0.0 --port 8769
       - name: Wait for MCP endpoints
         run: |
-          for port in 18767 18768; do
+          for port in 18767 18768 18769; do
             ready=false
             for attempt in $(seq 1 30); do
-              if curl --fail --silent --show-error \
+              if curl --noproxy '*' --fail --silent --show-error \
                 "http://127.0.0.1:${port}/health/ready" >/dev/null; then
                 ready=true
                 break
@@ -103,6 +160,8 @@ jobs:
             if [ "$ready" != true ]; then
               docker logs private-dav-carddav-contract || true
               docker logs private-dav-caldav-contract || true
+              docker logs private-dav-gateway-contract || true
+              cat .contract-dav.log || true
               exit 1
             fi
           done
@@ -110,15 +169,27 @@ jobs:
         env:
           PRIVATE_DAV_CARDDAV_CONTRACT_URL: http://127.0.0.1:18767/mcp
           PRIVATE_DAV_CALDAV_CONTRACT_URL: http://127.0.0.1:18768/mcp
-        run: uv run --no-sync pytest tests/test_container_contract.py
+          PRIVATE_DAV_GATEWAY_CONTRACT_URL: http://127.0.0.1:18769
+          PRIVATE_DAV_GATEWAY_CONTRACT_SIGNING_KEY: .contract-certs/jwt-private.pem
+        run: uv run --no-sync pytest tests/test_container_contract.py tests/test_gateway_container_contract.py
       - name: Show container logs
         if: failure()
         run: |
           docker logs private-dav-carddav-contract || true
           docker logs private-dav-caldav-contract || true
+          docker logs private-dav-gateway-contract || true
+          cat .contract-dav.log || true
       - name: Stop containers
         if: always()
-        run: docker rm --force private-dav-carddav-contract private-dav-caldav-contract || true
+        run: |
+          docker rm --force \
+            private-dav-carddav-contract \
+            private-dav-caldav-contract \
+            private-dav-gateway-contract || true
+          if [ -f .contract-dav.pid ]; then
+            kill "$(cat .contract-dav.pid)" || true
+          fi
+          rm -rf .contract-certs .contract-dav.log .contract-dav.pid
 
   production-image:
     name: Build, attest, publish, and sign image
