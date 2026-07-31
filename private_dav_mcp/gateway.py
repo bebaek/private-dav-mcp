@@ -356,6 +356,7 @@ def create_gateway_app(
     async def health_ready() -> JSONResponse:
         try:
             await run_in_threadpool(store.check_ready)
+            await run_in_threadpool(calendar_mcp.check_ready)
         except Exception:
             return JSONResponse(status_code=503, content={"status": "not_ready"})
         return JSONResponse(status_code=200, content={"status": "ready"})

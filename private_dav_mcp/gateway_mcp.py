@@ -166,6 +166,19 @@ class GatewayCalendarMCP:
         self._servers: dict[tuple[str, str, str], _AccountServer] = {}
         self._routes: dict[tuple[str, str, str], _ReferenceRoute] = {}
 
+    def check_ready(self) -> None:
+        for template in self._static_accounts:
+            identity = GatewayIdentity(
+                tenant_id=(template.tenant_id if template.tenant_id != "*" else "__health__"),
+                user_id=(template.user_id if template.user_id != "*" else "__health__"),
+                scopes=frozenset(),
+                token_id="__health__",
+            )
+            account = template.for_identity(identity)
+            if account is None:  # pragma: no cover - identity is derived from the template
+                raise RuntimeError("Static account owner configuration is invalid")
+            self._server_for(account).server.check_ready()
+
     def handle(self, identity: GatewayIdentity, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")
         method = payload.get("method")

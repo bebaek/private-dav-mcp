@@ -435,6 +435,7 @@ def test_static_caldav_accounts_are_owner_scoped_without_database_onboarding(
         scopes=frozenset({"dav:calendar:read"}),
     )
 
+    broker.check_ready()
     owner_accounts = broker.handle(
         owner,
         {
