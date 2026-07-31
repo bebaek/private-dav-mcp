@@ -382,14 +382,29 @@ def test_gateway_settings_load_static_caldav_account_from_environment(
     monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_PASSWORD", "environment-secret")
     monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_LABEL", "Personal")
     monkeypatch.setenv("PRIVATE_DAV_GATEWAY_CALDAV_USER_ID", "user-a")
+    monkeypatch.setenv(
+        "PRIVATE_DAV_GATEWAY_STATIC_ICS_SUBSCRIPTIONS",
+        json.dumps(
+            [
+                {
+                    "id": "public-events",
+                    "label": "Public events",
+                    "url": "https://calendar.example/public/basic.ics",
+                    "user_id": "user-a",
+                }
+            ]
+        ),
+    )
 
     settings = GatewaySettings.from_env()
 
-    assert len(settings.static_accounts) == 1
+    assert len(settings.static_accounts) == 2
     account = settings.static_accounts[0]
+    assert isinstance(account, StaticCalendarAccount)
     assert account.account_id == "primary"
     assert account.user_id == "user-a"
     assert account.password == "environment-secret"
+    assert settings.static_accounts[1].base_url == "https://calendar.example/public/basic.ics"
     assert "environment-secret" not in repr(account)
 
 

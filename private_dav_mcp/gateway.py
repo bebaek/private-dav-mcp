@@ -19,7 +19,12 @@ from starlette.concurrency import run_in_threadpool
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
-from private_dav_mcp.gateway_mcp import GatewayCalendarMCP, StaticCalendarAccount
+from private_dav_mcp.gateway_mcp import (
+    GatewayCalendarMCP,
+    StaticCalendarAccount,
+    StaticGatewayAccount,
+    StaticICSSubscription,
+)
 from private_dav_mcp.gateway_store import (
     AccountCipher,
     AccountStore,
@@ -220,6 +225,51 @@ def _static_accounts_from_env(env: Mapping[str, str]) -> tuple[StaticCalendarAcc
     return tuple(accounts)
 
 
+def _static_ics_subscriptions_from_env(
+    env: Mapping[str, str],
+) -> tuple[StaticICSSubscription, ...]:
+    raw = env.get("PRIVATE_DAV_GATEWAY_STATIC_ICS_SUBSCRIPTIONS", "").strip()
+    if not raw:
+        return ()
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Static ICS subscriptions setting must be valid JSON") from exc
+    if not isinstance(parsed, list) or len(parsed) > 50:
+        raise RuntimeError("Static ICS subscriptions setting must be an array of at most 50 items")
+    subscriptions: list[StaticICSSubscription] = []
+    identities: set[tuple[str, str, str]] = set()
+    for index, entry in enumerate(parsed):
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"Static ICS subscription {index} must be an object")
+        if any(
+            not isinstance(entry.get(key), str) or not entry[key] for key in ("id", "label", "url")
+        ):
+            raise RuntimeError(
+                f"Static ICS subscription {index} is missing a required string field"
+            )
+        tenant_id = entry.get("tenant_id", "*")
+        user_id = entry.get("user_id", "*")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise RuntimeError(f"Static ICS subscription {index} has an invalid tenant_id")
+        if not isinstance(user_id, str) or not user_id:
+            raise RuntimeError(f"Static ICS subscription {index} has an invalid user_id")
+        identity = (tenant_id, user_id, entry["id"])
+        if identity in identities:
+            raise RuntimeError(f"Static ICS subscription {index} has a duplicate owner and id")
+        identities.add(identity)
+        subscriptions.append(
+            StaticICSSubscription(
+                subscription_id=entry["id"],
+                label=entry["label"],
+                url=entry["url"],
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        )
+    return tuple(subscriptions)
+
+
 @dataclass(frozen=True)
 class GatewaySettings:
     db_path: str
@@ -230,7 +280,7 @@ class GatewaySettings:
     active_encryption_key_version: int
     allowed_networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]
     allowed_host_suffixes: tuple[str, ...]
-    static_accounts: tuple[StaticCalendarAccount, ...]
+    static_accounts: tuple[StaticGatewayAccount, ...]
 
     @classmethod
     def from_env(cls) -> GatewaySettings:
@@ -267,7 +317,10 @@ class GatewaySettings:
             ),
             allowed_networks=allowed_networks,
             allowed_host_suffixes=suffixes,
-            static_accounts=_static_accounts_from_env(os.environ),
+            static_accounts=(
+                *_static_accounts_from_env(os.environ),
+                *_static_ics_subscriptions_from_env(os.environ),
+            ),
         )
 
 

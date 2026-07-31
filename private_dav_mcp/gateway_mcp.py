@@ -24,6 +24,7 @@ from private_dav_mcp.caldav import (
 )
 from private_dav_mcp.gateway_identity import GatewayIdentity
 from private_dav_mcp.gateway_store import AccountStore, GatewayAccount, PasswordCredential
+from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 
 CALENDAR_ACCOUNTS_LIST_TOOL = {
@@ -137,6 +138,58 @@ class StaticCalendarAccount:
         )
 
 
+@dataclass(frozen=True, repr=False)
+class StaticICSSubscription:
+    subscription_id: str
+    label: str
+    url: str
+    tenant_id: str = "*"
+    user_id: str = "*"
+
+    @property
+    def base_url(self) -> str:
+        return self.url
+
+    def for_identity(self, identity: GatewayIdentity) -> GatewayAccount | None:
+        if self.tenant_id not in {"*", identity.tenant_id} or self.user_id not in {
+            "*",
+            identity.user_id,
+        }:
+            return None
+        owner = f"{identity.tenant_id}\0{identity.user_id}\0ics\0{self.subscription_id}".encode()
+        account_ref = "acct_" + base64.urlsafe_b64encode(
+            hashlib.sha256(owner).digest()[:18]
+        ).decode().rstrip("=")
+        revision = (
+            "env:"
+            + hashlib.sha256(
+                json.dumps(
+                    {"id": self.subscription_id, "label": self.label, "url": self.url},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+        )
+        return GatewayAccount(
+            account_ref=account_ref,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
+            kind="ics",
+            label=self.label,
+            base_url=self.url,
+            credential=PasswordCredential(username="", password="", mode="none"),
+            status="configured",
+            enabled=True,
+            last_checked_at=None,
+            last_error=None,
+            created_at="env",
+            updated_at=revision,
+        )
+
+
+StaticGatewayAccount = StaticCalendarAccount | StaticICSSubscription
+
+
 @dataclass
 class _AccountServer:
     account_ref: str
@@ -157,7 +210,7 @@ class GatewayCalendarMCP:
         store: AccountStore,
         *,
         server_factory: Callable[[GatewayAccount], PrivateCalendarMCPServer] | None = None,
-        static_accounts: tuple[StaticCalendarAccount, ...] = (),
+        static_accounts: tuple[StaticGatewayAccount, ...] = (),
     ) -> None:
         self._store = store
         self._static_accounts = static_accounts
@@ -237,6 +290,12 @@ class GatewayCalendarMCP:
         if not isinstance(reference, str) or not reference:
             raise ValueError(f"{name} requires {reference_name}")
         account, account_server = self._resolve_route(identity, reference, reference_type)
+        if account.kind == "ics" and name in {
+            "events_create",
+            "events_update",
+            "events_delete",
+        }:
+            raise PermissionError("ICS calendar subscriptions are read-only")
         response = self._delegate(account_server.server, name, arguments)
         result = _extract_result(response)
         if name in {"events_list", "events_create"}:
@@ -501,6 +560,13 @@ class GatewayCalendarMCP:
 
 
 def _default_server_factory(account: GatewayAccount) -> PrivateCalendarMCPServer:
+    if account.kind == "ics":
+        return PrivateCalendarMCPServer(
+            calendar_source=ICSSubscriptionCalendarSource(
+                url=account.base_url,
+                label=account.label,
+            )
+        )
     source = CalDAVCalendarSource(
         calendar_url=account.base_url,
         username=account.credential.username,

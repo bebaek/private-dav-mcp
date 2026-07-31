@@ -110,6 +110,18 @@ PRIVATE_DAV_GATEWAY_CALDAV_USER_ID
 
 The JSON form and single-account form are mutually exclusive.
 
+Public, read-only iCalendar feeds use a separate setting:
+
+```dotenv
+PRIVATE_DAV_GATEWAY_STATIC_ICS_SUBSCRIPTIONS=[{"id":"public-events","label":"Public events","url":"https://calendar.example/public/basic.ics","tenant_id":"tenant-a","user_id":"user-a"}]
+```
+
+The gateway fetches each subscription over HTTPS, limits responses to 5 MB, caches parsed feeds for
+five minutes, and expands recurring events within the requested range. Subscription event fields
+use the same private-value envelope as CalDAV. Create, update, and delete operations are rejected as
+read-only. Up to 50 subscriptions are supported; exact tenant and user values are recommended for
+multi-user deployments.
+
 Implemented interfaces:
 
 - `GET/POST /v1/accounts`
