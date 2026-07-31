@@ -110,7 +110,9 @@ class ICSSubscriptionCalendarSource:
         return [
             resource.event
             for resource in resources
-            if not resource.event.transparent and not resource.event.cancelled
+            if not resource.event.transparent
+            and not resource.event.cancelled
+            and _has_positive_duration(resource.event)
         ], truncated
 
     def create_event(self, calendar: Calendar, event: Event) -> EventResource:
@@ -164,6 +166,21 @@ class ICSSubscriptionCalendarSource:
             self._cached_calendar = parsed
             self._cached_at = now
         return parsed
+
+
+def _has_positive_duration(event: Event) -> bool:
+    try:
+        if event.all_day:
+            return date.fromisoformat(event.end) > date.fromisoformat(event.start)
+        start = datetime.fromisoformat(event.start.replace("Z", "+00:00"))
+        end = datetime.fromisoformat(event.end.replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        return end.astimezone(timezone.utc) > start.astimezone(timezone.utc)
+    except ValueError:
+        return False
 
 
 def _event_from_component(component: Any) -> tuple[Event, datetime]:

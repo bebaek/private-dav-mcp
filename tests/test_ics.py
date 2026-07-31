@@ -29,6 +29,12 @@ DTEND;VALUE=DATE:20260806
 SUMMARY:Private all day event
 TRANSP:TRANSPARENT
 END:VEVENT
+BEGIN:VEVENT
+UID:no-end-1
+DTSTAMP:20260701T000000Z
+DTSTART:20260806T120000Z
+SUMMARY:Zero duration informational event
+END:VEVENT
 END:VCALENDAR
 """
 
@@ -62,7 +68,7 @@ def test_ics_subscription_fetches_caches_and_expands_events() -> None:
 
     assert requests == 1
     assert truncated is False
-    assert len(resources) == 4
+    assert len(resources) == 5
     assert [resource.event.summary for resource in resources[:3]] == [
         "Recurring private event",
         "Recurring private event",
@@ -73,6 +79,7 @@ def test_ics_subscription_fetches_caches_and_expands_events() -> None:
     assert resources[0].event.attendees == ("person@example.com",)
     assert resources[3].event.all_day is True
     assert resources[3].event.transparent is True
+    assert resources[4].event.start == resources[4].event.end
 
     busy, busy_truncated = source.list_busy_events(
         calendars[0],
