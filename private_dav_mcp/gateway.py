@@ -19,6 +19,7 @@ from starlette.concurrency import run_in_threadpool
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
+from private_dav_mcp.gateway_mcp import GatewayCalendarMCP
 from private_dav_mcp.gateway_store import (
     AccountCipher,
     AccountStore,
@@ -205,6 +206,7 @@ def create_gateway_app(
     store: AccountStore | None = None,
     connector: AccountConnector | None = None,
     url_policy: OutboundURLPolicy | None = None,
+    calendar_mcp: GatewayCalendarMCP | None = None,
     settings: GatewaySettings | None = None,
 ) -> FastAPI:
     if verifier is None or store is None:
@@ -227,6 +229,7 @@ def create_gateway_app(
         )
     connector = connector or CalDAVAccountConnector()
     url_policy = url_policy or OutboundURLPolicy()
+    calendar_mcp = calendar_mcp or GatewayCalendarMCP(store)
     app = FastAPI(title="Private DAV Gateway", version="1")
 
     @app.exception_handler(GatewayAPIError)
@@ -279,6 +282,36 @@ def create_gateway_app(
         except Exception:
             return JSONResponse(status_code=503, content={"status": "not_ready"})
         return JSONResponse(status_code=200, content={"status": "ready"})
+
+    @app.post("/mcp")
+    async def mcp_endpoint(
+        request: Request,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> Response:
+        try:
+            payload = await request.json()
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32700, "message": "Invalid JSON"},
+                },
+            )
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {"code": -32600, "message": "Request must be an object"},
+                },
+            )
+        result = await run_in_threadpool(calendar_mcp.handle, identity, payload)
+        if result is None:
+            return Response(status_code=202)
+        return JSONResponse(status_code=200, content=result)
 
     @app.get("/v1/accounts")
     async def list_accounts(

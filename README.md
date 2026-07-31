@@ -32,10 +32,11 @@ endpoints.
 The accepted next architecture evolves these sidecars into an identity-aware, multi-tenant DAV
 privacy gateway with a management API and MCP interface. See
 [ADR 0001](docs/adr/0001-multitenant-dav-privacy-gateway.md) and the draft
-[gateway contract v1](docs/gateway-contract-v1.md). The first implementation milestone now includes
-identity-token verification, an encrypted SQLite account vault, outbound URL policy, and
-owner-scoped account lifecycle endpoints. Gateway MCP and calendar configuration routes remain
-planned; the gateway does not replace the current executable sidecar contract yet.
+[gateway contract v1](docs/gateway-contract-v1.md). The gateway now includes identity-token
+verification, an encrypted SQLite account vault, outbound URL policy, owner-scoped account
+lifecycle endpoints, and an authenticated multi-account calendar MCP endpoint. Calendar preference
+routes and durable cross-replica MCP references remain planned; the gateway does not replace the
+current executable sidecar contract yet.
 
 To run that suite locally:
 
@@ -84,17 +85,21 @@ JWT values are PEM public keys. Optional `PRIVATE_DAV_GATEWAY_ALLOWED_NETWORKS` 
 `PRIVATE_DAV_GATEWAY_ALLOWED_HOST_SUFFIXES` provide administrator-controlled outbound DAV policy.
 Do not put private keys, bearer tokens, or plaintext DAV credentials in these settings.
 
-Implemented management routes:
+Implemented interfaces:
 
 - `GET/POST /v1/accounts`
 - `GET/PATCH/DELETE /v1/accounts/{account_ref}`
 - `POST /v1/accounts/{account_ref}/test`
+- `POST /mcp` with `calendar_accounts_list`, `calendars_list`, event tools, and multi-calendar
+  `free_busy`
 - `GET /health/live`
 - `GET /health/ready`
 
 Credential fields are write-only and account labels, URLs, usernames, and passwords are encrypted
-at rest with a per-account DEK wrapped by the active deployment KEK. Every account query is scoped
-to the tenant and user from the verified bearer token.
+at rest with a per-account DEK wrapped by the active deployment KEK. Every account and MCP request
+is scoped to the tenant and user from the verified bearer token. Gateway calendar and event
+references are currently account-bound, owner-bound, process-local, and invalidated by account
+updates; durable cross-replica references are a later milestone.
 
 ## CardDAV
 

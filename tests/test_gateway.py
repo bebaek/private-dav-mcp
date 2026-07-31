@@ -17,12 +17,14 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from fastapi.testclient import TestClient
 
+from private_dav_mcp.caldav import Calendar, Event, PrivateCalendarMCPServer
 from private_dav_mcp.gateway import (
     AccountConnectionError,
     OutboundURLPolicy,
     create_gateway_app,
 )
 from private_dav_mcp.gateway_identity import IdentityError, IdentityVerifier
+from private_dav_mcp.gateway_mcp import GatewayCalendarMCP
 from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
 
 ISSUER = "https://minigent.example"
@@ -69,11 +71,19 @@ def gateway(
     store = AccountStore(db_path, cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1))
     connector = FakeConnector()
     policy = OutboundURLPolicy(resolver=lambda _host: ["93.184.216.34"])
+    calendar_mcp = GatewayCalendarMCP(
+        store,
+        server_factory=lambda _account: PrivateCalendarMCPServer(
+            calendars=[Calendar("Personal", "https://dav.example/personal/")],
+            events=[Event("Private meeting", "2026-08-01T14:00:00Z", "2026-08-01T15:00:00Z")],
+        ),
+    )
     app = create_gateway_app(
         verifier=verifier,
         store=store,
         connector=connector,
         url_policy=policy,
+        calendar_mcp=calendar_mcp,
     )
     return TestClient(app), private_pem, connector, db_path
 
@@ -83,7 +93,7 @@ def _token(
     *,
     tenant_id: str = "tenant-a",
     user_id: str = "user-a",
-    scopes: str = "dav:accounts:read dav:accounts:write",
+    scopes: str = ("dav:accounts:read dav:accounts:write dav:calendar:read dav:calendar:write"),
     audience: str = AUDIENCE,
 ) -> str:
     now = int(time.time())
@@ -219,6 +229,101 @@ def test_account_lifecycle_is_owner_scoped_and_credentials_are_write_only(
     deleted = client.delete(f"/v1/accounts/{account_ref}", headers=owner_headers)
     assert deleted.status_code == 204
     assert client.get(f"/v1/accounts/{account_ref}", headers=owner_headers).status_code == 404
+
+
+def _mcp(
+    client: TestClient,
+    headers: dict[str, str],
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    request_id: int = 1,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    response = client.post("/mcp", headers=headers, json=payload)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def test_gateway_mcp_routes_accounts_calendars_and_free_busy_by_owner(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, _db_path = gateway
+    headers = _headers(private_pem)
+    created = client.post("/v1/accounts", headers=headers, json=_account_payload())
+    assert created.status_code == 201
+
+    initialized = _mcp(client, headers, "initialize", {})
+    assert initialized["result"]["serverInfo"]["name"] == "private-dav-gateway"
+    tools = _mcp(client, headers, "tools/list")["result"]["tools"]
+    assert [tool["name"] for tool in tools] == [
+        "calendar_accounts_list",
+        "calendars_list",
+        "events_list",
+        "events_get",
+        "free_busy",
+        "events_create",
+        "events_update",
+        "events_delete",
+    ]
+
+    accounts = _mcp(
+        client,
+        headers,
+        "tools/call",
+        {"name": "calendar_accounts_list", "arguments": {}},
+    )["result"]
+    assert len(accounts["structuredContent"]["accounts"]) == 1
+    assert "Private calendar canary" not in str(accounts["structuredContent"])
+    assert set(accounts["_meta"]["io.minigent/private-values"].values()) == {
+        "Private calendar canary"
+    }
+
+    calendars = _mcp(
+        client,
+        headers,
+        "tools/call",
+        {"name": "calendars_list", "arguments": {}},
+    )["result"]
+    calendar_ref = calendars["structuredContent"]["calendars"][0]["calendar_ref"]
+    busy = _mcp(
+        client,
+        headers,
+        "tools/call",
+        {
+            "name": "free_busy",
+            "arguments": {
+                "calendar_refs": [calendar_ref],
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )["result"]["structuredContent"]
+    assert busy == {
+        "busy": [{"start": "2026-08-01T14:00:00Z", "end": "2026-08-01T15:00:00Z"}],
+        "truncated": False,
+        "partial": False,
+        "queried_calendar_count": 1,
+        "failed_calendar_count": 0,
+    }
+
+    cross_owner = _mcp(
+        client,
+        _headers(private_pem, user_id="user-b"),
+        "tools/call",
+        {
+            "name": "free_busy",
+            "arguments": {
+                "calendar_ref": calendar_ref,
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )
+    assert cross_owner["error"]["code"] == -32002
+    assert "Private" not in str(cross_owner)
 
 
 def test_gateway_enforces_scopes_authentication_and_url_policy(
