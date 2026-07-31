@@ -32,8 +32,10 @@ endpoints.
 The accepted next architecture evolves these sidecars into an identity-aware, multi-tenant DAV
 privacy gateway with a management API and MCP interface. See
 [ADR 0001](docs/adr/0001-multitenant-dav-privacy-gateway.md) and the draft
-[gateway contract v1](docs/gateway-contract-v1.md). These documents describe planned behavior and
-do not replace the current executable sidecar contract yet.
+[gateway contract v1](docs/gateway-contract-v1.md). The first implementation milestone now includes
+identity-token verification, an encrypted SQLite account vault, outbound URL policy, and
+owner-scoped account lifecycle endpoints. Gateway MCP and calendar configuration routes remain
+planned; the gateway does not replace the current executable sidecar contract yet.
 
 To run that suite locally:
 
@@ -57,6 +59,42 @@ The production image is vulnerability-scanned before publication, receives attac
 provenance attestations, and is signed by the GitHub Actions OIDC identity. Semantic-version tags
 publish matching container tags and generated GitHub release notes. See
 [`docs/releasing.md`](docs/releasing.md) for the release procedure and verification commands.
+
+## Experimental multi-tenant gateway
+
+The gateway process listens on port `8769` by default:
+
+```bash
+uv run private-dav-gateway --host 127.0.0.1 --port 8769
+```
+
+It requires a SQLite path, JWT issuer/public-key ring, and versioned 32-byte encryption-key ring:
+
+```text
+PRIVATE_DAV_GATEWAY_DB_PATH
+PRIVATE_DAV_GATEWAY_JWT_ISSUER
+PRIVATE_DAV_GATEWAY_JWT_AUDIENCE
+PRIVATE_DAV_GATEWAY_JWT_PUBLIC_KEYS
+PRIVATE_DAV_GATEWAY_ENCRYPTION_KEYS
+PRIVATE_DAV_GATEWAY_ACTIVE_ENCRYPTION_KEY_VERSION
+```
+
+Keyrings are JSON objects keyed by version or JWT `kid`. Encryption values are URL-safe base64;
+JWT values are PEM public keys. Optional `PRIVATE_DAV_GATEWAY_ALLOWED_NETWORKS` and
+`PRIVATE_DAV_GATEWAY_ALLOWED_HOST_SUFFIXES` provide administrator-controlled outbound DAV policy.
+Do not put private keys, bearer tokens, or plaintext DAV credentials in these settings.
+
+Implemented management routes:
+
+- `GET/POST /v1/accounts`
+- `GET/PATCH/DELETE /v1/accounts/{account_ref}`
+- `POST /v1/accounts/{account_ref}/test`
+- `GET /health/live`
+- `GET /health/ready`
+
+Credential fields are write-only and account labels, URLs, usernames, and passwords are encrypted
+at rest with a per-account DEK wrapped by the active deployment KEK. Every account query is scoped
+to the tenant and user from the verified bearer token.
 
 ## CardDAV
 

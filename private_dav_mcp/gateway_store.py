@@ -1,0 +1,470 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sqlite3
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+@dataclass(frozen=True, repr=False)
+class PasswordCredential:
+    username: str
+    password: str
+    mode: str
+
+
+@dataclass(frozen=True, repr=False)
+class GatewayAccount:
+    account_ref: str
+    tenant_id: str
+    user_id: str
+    kind: str
+    label: str
+    base_url: str
+    credential: PasswordCredential
+    status: str
+    enabled: bool
+    last_checked_at: str | None
+    last_error: str | None
+    created_at: str
+    updated_at: str
+
+
+class AccountCipher:
+    def __init__(self, *, keyring: dict[int, bytes], active_version: int) -> None:
+        if active_version not in keyring:
+            raise ValueError("Active gateway encryption key is not present in the keyring")
+        if any(len(key) != 32 for key in keyring.values()):
+            raise ValueError("Gateway encryption keys must be 32 bytes")
+        self._keyring = dict(keyring)
+        self._active_version = active_version
+
+    @property
+    def active_version(self) -> int:
+        return self._active_version
+
+    def new_data_key(self) -> bytes:
+        return secrets.token_bytes(32)
+
+    def wrap_data_key(self, data_key: bytes, *, owner_aad: bytes) -> tuple[int, bytes]:
+        return self._active_version, self._encrypt(
+            self._keyring[self._active_version], data_key, owner_aad + b"|dek"
+        )
+
+    def unwrap_data_key(self, wrapped: bytes, *, key_version: int, owner_aad: bytes) -> bytes:
+        try:
+            key = self._keyring[key_version]
+        except KeyError as exc:
+            raise RuntimeError("Account encryption key version is unavailable") from exc
+        return self._decrypt(key, wrapped, owner_aad + b"|dek")
+
+    @staticmethod
+    def encrypt_field(data_key: bytes, value: str, *, aad: bytes) -> bytes:
+        return AccountCipher._encrypt(data_key, value.encode(), aad)
+
+    @staticmethod
+    def decrypt_field(data_key: bytes, value: bytes, *, aad: bytes) -> str:
+        return AccountCipher._decrypt(data_key, value, aad).decode()
+
+    @staticmethod
+    def _encrypt(key: bytes, plaintext: bytes, aad: bytes) -> bytes:
+        nonce = secrets.token_bytes(12)
+        return nonce + AESGCM(key).encrypt(nonce, plaintext, aad)
+
+    @staticmethod
+    def _decrypt(key: bytes, ciphertext: bytes, aad: bytes) -> bytes:
+        if len(ciphertext) < 29:
+            raise RuntimeError("Encrypted account value is invalid")
+        return AESGCM(key).decrypt(ciphertext[:12], ciphertext[12:], aad)
+
+    def fingerprint(self, value: bytes) -> str:
+        return hmac.new(
+            self._keyring[self._active_version],
+            b"private-dav|idempotency|" + value,
+            hashlib.sha256,
+        ).hexdigest()
+
+    @staticmethod
+    def decode_keyring(encoded: dict[str, str]) -> dict[int, bytes]:
+        result: dict[int, bytes] = {}
+        for version, value in encoded.items():
+            try:
+                result[int(version)] = base64.urlsafe_b64decode(value)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Gateway encryption keyring is invalid") from exc
+        return result
+
+
+class AccountStore:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        cipher: AccountCipher,
+        max_accounts_per_user: int = 10,
+    ) -> None:
+        if max_accounts_per_user < 1:
+            raise ValueError("Account limit must be positive")
+        self._path = str(path)
+        self._cipher = cipher
+        self._max_accounts_per_user = max_accounts_per_user
+        Path(self._path).parent.mkdir(parents=True, exist_ok=True)
+        self._migrate()
+        os.chmod(self._path, 0o600)
+
+    def check_ready(self) -> None:
+        with self._connect() as connection:
+            connection.execute("SELECT 1").fetchone()
+
+    def create_account(
+        self,
+        *,
+        tenant_id: str,
+        user_id: str,
+        kind: str,
+        label: str,
+        base_url: str,
+        credential: PasswordCredential,
+        enabled: bool,
+        status: str,
+        last_error: str | None,
+        idempotency_key: str | None,
+        request_hash: str | None,
+    ) -> tuple[GatewayAccount, bool]:
+        now = _utc_now()
+        account_ref = f"acct_{secrets.token_urlsafe(24)}"
+        account = GatewayAccount(
+            account_ref=account_ref,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            kind=kind,
+            label=label,
+            base_url=base_url,
+            credential=credential,
+            status=status,
+            enabled=enabled,
+            last_checked_at=now,
+            last_error=last_error,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if idempotency_key is not None:
+                existing = connection.execute(
+                    """
+                    SELECT request_hash, account_ref FROM account_idempotency
+                    WHERE tenant_id = ? AND user_id = ? AND idempotency_key = ?
+                    """,
+                    (tenant_id, user_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    if existing["request_hash"] != request_hash:
+                        raise ValueError("Idempotency key was already used for another request")
+                    stored = self._get_account(
+                        connection, tenant_id, user_id, existing["account_ref"]
+                    )
+                    if stored is None:
+                        raise RuntimeError("Idempotent account result is unavailable")
+                    connection.commit()
+                    return stored, False
+            account_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM dav_accounts
+                WHERE tenant_id = ? AND user_id = ?
+                """,
+                (tenant_id, user_id),
+            ).fetchone()[0]
+            if account_count >= self._max_accounts_per_user:
+                raise OverflowError("Account limit reached")
+            self._insert_account(connection, account)
+            if idempotency_key is not None:
+                connection.execute(
+                    """
+                    INSERT INTO account_idempotency
+                      (tenant_id, user_id, idempotency_key, request_hash, account_ref, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (tenant_id, user_id, idempotency_key, request_hash, account_ref, now),
+                )
+            self._audit(connection, account, "account.create", "success")
+            connection.commit()
+        return account, True
+
+    def list_accounts(self, tenant_id: str, user_id: str, *, limit: int) -> list[GatewayAccount]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM dav_accounts
+                WHERE tenant_id = ? AND user_id = ?
+                ORDER BY created_at, account_ref LIMIT ?
+                """,
+                (tenant_id, user_id, limit),
+            ).fetchall()
+            return [self._decode_account(row) for row in rows]
+
+    def get_account(self, tenant_id: str, user_id: str, account_ref: str) -> GatewayAccount | None:
+        with self._connect() as connection:
+            return self._get_account(connection, tenant_id, user_id, account_ref)
+
+    def update_account(self, account: GatewayAccount, *, audit_operation: str) -> GatewayAccount:
+        updated = replace(account, updated_at=_utc_now())
+        encrypted = self._encrypt_account(updated)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE dav_accounts SET
+                  label_cipher = ?, base_url_cipher = ?, auth_cipher = ?, wrapped_dek = ?,
+                  key_version = ?, auth_type = ?, auth_mode = ?, status = ?, enabled = ?,
+                  last_checked_at = ?, last_error = ?, updated_at = ?
+                WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (
+                    encrypted["label_cipher"],
+                    encrypted["base_url_cipher"],
+                    encrypted["auth_cipher"],
+                    encrypted["wrapped_dek"],
+                    encrypted["key_version"],
+                    "password",
+                    updated.credential.mode,
+                    updated.status,
+                    int(updated.enabled),
+                    updated.last_checked_at,
+                    updated.last_error,
+                    updated.updated_at,
+                    updated.account_ref,
+                    updated.tenant_id,
+                    updated.user_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("Account not found")
+            self._audit(connection, updated, audit_operation, "success")
+            connection.commit()
+        return updated
+
+    def delete_account(self, tenant_id: str, user_id: str, account_ref: str) -> bool:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = self._get_account(connection, tenant_id, user_id, account_ref)
+            if account is None:
+                connection.rollback()
+                return False
+            self._audit(connection, account, "account.delete", "success")
+            connection.execute(
+                "DELETE FROM dav_accounts WHERE account_ref = ? AND tenant_id = ? AND user_id = ?",
+                (account_ref, tenant_id, user_id),
+            )
+            connection.commit()
+            return True
+
+    def _insert_account(self, connection: sqlite3.Connection, account: GatewayAccount) -> None:
+        encrypted = self._encrypt_account(account)
+        connection.execute(
+            """
+            INSERT INTO dav_accounts (
+              account_ref, tenant_id, user_id, kind, label_cipher, base_url_cipher, auth_cipher,
+              wrapped_dek, key_version, auth_type, auth_mode, status, enabled, last_checked_at,
+              last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account.account_ref,
+                account.tenant_id,
+                account.user_id,
+                account.kind,
+                encrypted["label_cipher"],
+                encrypted["base_url_cipher"],
+                encrypted["auth_cipher"],
+                encrypted["wrapped_dek"],
+                encrypted["key_version"],
+                "password",
+                account.credential.mode,
+                account.status,
+                int(account.enabled),
+                account.last_checked_at,
+                account.last_error,
+                account.created_at,
+                account.updated_at,
+            ),
+        )
+
+    def _get_account(
+        self, connection: sqlite3.Connection, tenant_id: str, user_id: str, account_ref: str
+    ) -> GatewayAccount | None:
+        row = connection.execute(
+            """
+            SELECT * FROM dav_accounts
+            WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
+            """,
+            (account_ref, tenant_id, user_id),
+        ).fetchone()
+        return self._decode_account(row) if row is not None else None
+
+    def _encrypt_account(self, account: GatewayAccount) -> dict[str, bytes | int]:
+        data_key = self._cipher.new_data_key()
+        owner_aad = _account_aad(account.tenant_id, account.user_id, account.account_ref)
+        key_version, wrapped = self._cipher.wrap_data_key(data_key, owner_aad=owner_aad)
+        auth = json.dumps(
+            {
+                "username": account.credential.username,
+                "password": account.credential.password,
+                "mode": account.credential.mode,
+            },
+            separators=(",", ":"),
+        )
+        return {
+            "label_cipher": self._cipher.encrypt_field(
+                data_key, account.label, aad=owner_aad + b"|label"
+            ),
+            "base_url_cipher": self._cipher.encrypt_field(
+                data_key, account.base_url, aad=owner_aad + b"|base_url"
+            ),
+            "auth_cipher": self._cipher.encrypt_field(data_key, auth, aad=owner_aad + b"|auth"),
+            "wrapped_dek": wrapped,
+            "key_version": key_version,
+        }
+
+    def _decode_account(self, row: sqlite3.Row) -> GatewayAccount:
+        owner_aad = _account_aad(row["tenant_id"], row["user_id"], row["account_ref"])
+        data_key = self._cipher.unwrap_data_key(
+            row["wrapped_dek"], key_version=row["key_version"], owner_aad=owner_aad
+        )
+        auth = json.loads(
+            self._cipher.decrypt_field(data_key, row["auth_cipher"], aad=owner_aad + b"|auth")
+        )
+        return GatewayAccount(
+            account_ref=row["account_ref"],
+            tenant_id=row["tenant_id"],
+            user_id=row["user_id"],
+            kind=row["kind"],
+            label=self._cipher.decrypt_field(
+                data_key, row["label_cipher"], aad=owner_aad + b"|label"
+            ),
+            base_url=self._cipher.decrypt_field(
+                data_key, row["base_url_cipher"], aad=owner_aad + b"|base_url"
+            ),
+            credential=PasswordCredential(
+                username=auth["username"], password=auth["password"], mode=auth["mode"]
+            ),
+            status=row["status"],
+            enabled=bool(row["enabled"]),
+            last_checked_at=row["last_checked_at"],
+            last_error=row["last_error"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    def request_hash(self, payload: dict[str, Any]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return self._cipher.fingerprint(encoded)
+
+    @staticmethod
+    def _audit(
+        connection: sqlite3.Connection,
+        account: GatewayAccount,
+        operation: str,
+        outcome: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO gateway_audit
+              (tenant_id, user_id, account_ref, operation, outcome, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account.tenant_id,
+                account.user_id,
+                account.account_ref,
+                operation,
+                outcome,
+                _utc_now(),
+            ),
+        )
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self._path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        return connection
+
+    def _migrate(self) -> None:
+        with self._connect() as connection:
+            connection.executescript(
+                """
+                PRAGMA journal_mode = WAL;
+                CREATE TABLE IF NOT EXISTS dav_accounts (
+                  account_ref TEXT PRIMARY KEY,
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  kind TEXT NOT NULL CHECK (kind = 'caldav'),
+                  label_cipher BLOB NOT NULL,
+                  base_url_cipher BLOB NOT NULL,
+                  auth_cipher BLOB NOT NULL,
+                  wrapped_dek BLOB NOT NULL,
+                  key_version INTEGER NOT NULL,
+                  auth_type TEXT NOT NULL CHECK (auth_type = 'password'),
+                  auth_mode TEXT NOT NULL,
+                  status TEXT NOT NULL,
+                  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                  last_checked_at TEXT,
+                  last_error TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS dav_accounts_owner
+                  ON dav_accounts (tenant_id, user_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS account_idempotency (
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  idempotency_key TEXT NOT NULL,
+                  request_hash TEXT NOT NULL,
+                  account_ref TEXT NOT NULL REFERENCES dav_accounts(account_ref) ON DELETE CASCADE,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY (tenant_id, user_id, idempotency_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS dav_references (
+                  token_hash TEXT PRIMARY KEY,
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  account_ref TEXT NOT NULL REFERENCES dav_accounts(account_ref) ON DELETE CASCADE,
+                  reference_type TEXT NOT NULL,
+                  resource_cipher BLOB NOT NULL,
+                  etag_cipher BLOB,
+                  expires_at TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS dav_references_owner
+                  ON dav_references (tenant_id, user_id, account_ref, reference_type);
+
+                CREATE TABLE IF NOT EXISTS gateway_audit (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  account_ref TEXT,
+                  operation TEXT NOT NULL,
+                  outcome TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                PRAGMA user_version = 1;
+                """
+            )
+
+
+def _account_aad(tenant_id: str, user_id: str, account_ref: str) -> bytes:
+    return f"private-dav|{tenant_id}|{user_id}|{account_ref}".encode()
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
