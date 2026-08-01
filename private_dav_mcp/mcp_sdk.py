@@ -14,7 +14,29 @@ from starlette.concurrency import run_in_threadpool
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION
 
 SDK_MCP_PROTOCOL_VERSION = mcp_types.LATEST_PROTOCOL_VERSION
-LegacyMCPHandler = Callable[[dict[str, Any]], dict[str, Any] | None]
+MCPToolHandler = Callable[[str, dict[str, Any]], dict[str, Any]]
+
+
+class MCPToolCallFailure(RuntimeError):
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def extract_mcp_tool_result(response: dict[str, Any]) -> dict[str, Any]:
+    error = response.get("error")
+    if isinstance(error, dict):
+        code = error.get("code")
+        message = error.get("message")
+        raise MCPToolCallFailure(
+            code if isinstance(code, int) else -32000,
+            message if isinstance(message, str) else "MCP tool call failed",
+        )
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise MCPToolCallFailure(-32603, "MCP tool handler returned an invalid result")
+    return result
 
 
 def build_mcp_sdk_server(
@@ -22,9 +44,9 @@ def build_mcp_sdk_server(
     name: str,
     version: str,
     tools: Sequence[dict[str, Any]],
-    handler: LegacyMCPHandler,
+    tool_handler: MCPToolHandler,
 ) -> Server[Any]:
-    """Build an SDK server while domain handlers retain their existing result contract."""
+    """Build an SDK server whose handlers call domain tool operations directly."""
 
     sdk_server: Server[Any] = Server(name, version=version)
     sdk_tools = [mcp_types.Tool.model_validate(tool) for tool in tools]
@@ -39,28 +61,14 @@ def build_mcp_sdk_server(
         _context: ServerRequestContext[Any, Any],
         params: mcp_types.CallToolRequestParams,
     ) -> mcp_types.CallToolResult:
-        response = await run_in_threadpool(
-            handler,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": params.name, "arguments": params.arguments or {}},
-            },
-        )
-        if not isinstance(response, dict):
-            raise MCPError(code=-32603, message="MCP tool handler returned no response")
-        error = response.get("error")
-        if isinstance(error, dict):
-            code = error.get("code")
-            message = error.get("message")
-            raise MCPError(
-                code=code if isinstance(code, int) else -32000,
-                message=message if isinstance(message, str) else "MCP tool call failed",
+        try:
+            result = await run_in_threadpool(
+                tool_handler,
+                params.name,
+                params.arguments or {},
             )
-        result = response.get("result")
-        if not isinstance(result, dict):
-            raise MCPError(code=-32603, message="MCP tool handler returned an invalid result")
+        except MCPToolCallFailure as exc:
+            raise MCPError(code=exc.code, message=exc.message) from exc
         return mcp_types.CallToolResult.model_validate(result)
 
     sdk_server.add_request_handler(

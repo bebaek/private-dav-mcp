@@ -135,8 +135,11 @@ def test_cached_readiness_check_without_upstream_is_ready() -> None:
 
 
 def _test_sdk_server():
-    def handler(_payload: dict[str, Any]) -> dict[str, Any] | None:
-        return None
+    def tool_handler(_name: str, _arguments: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "content": [{"type": "text", "text": "ok"}],
+            "structuredContent": {"ok": True},
+        }
 
     return build_mcp_sdk_server(
         name="contract-test",
@@ -152,7 +155,7 @@ def _test_sdk_server():
                 },
             }
         ],
-        handler=handler,
+        tool_handler=tool_handler,
     )
 
 

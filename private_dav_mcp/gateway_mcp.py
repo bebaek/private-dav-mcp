@@ -33,7 +33,11 @@ from private_dav_mcp.gateway_identity import GatewayIdentity
 from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountStore, GatewayAccount, PasswordCredential
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
-from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
+from private_dav_mcp.mcp_sdk import (
+    MCPToolCallFailure,
+    build_mcp_sdk_server,
+    extract_mcp_tool_result,
+)
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 
 CALENDAR_ACCOUNTS_LIST_TOOL = {
@@ -246,8 +250,30 @@ class GatewayCalendarMCP:
             name="private-dav-gateway",
             version=__version__,
             tools=GATEWAY_CALENDAR_TOOLS,
-            handler=lambda payload: self.handle(identity, payload),
+            tool_handler=lambda name, arguments: self.call_tool(identity, name, arguments),
         )
+
+    def call_tool(
+        self,
+        identity: GatewayIdentity,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            response = self._handle_tool_call(
+                identity,
+                1,
+                {"name": name, "arguments": arguments},
+            )
+            return extract_mcp_tool_result(response)
+        except MCPToolCallFailure:
+            raise
+        except PermissionError as exc:
+            raise MCPToolCallFailure(-32001, str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise MCPToolCallFailure(-32602, str(exc)) from exc
+        except Exception as exc:
+            raise MCPToolCallFailure(-32000, "Calendar operation failed") from exc
 
     def handle(self, identity: GatewayIdentity, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")
@@ -313,8 +339,7 @@ class GatewayCalendarMCP:
             "events_delete",
         }:
             raise PermissionError("ICS calendar subscriptions are read-only")
-        response = self._delegate(account_server.server, name, arguments)
-        result = _extract_result(response)
+        result = self._delegate(account_server.server, name, arguments)
         if name in {"events_list", "events_create"}:
             self._record_event_references(identity, account, result)
         return {"jsonrpc": "2.0", "id": request_id, "result": result}
@@ -372,9 +397,7 @@ class GatewayCalendarMCP:
         for account in accounts:
             try:
                 account_server = self._server_for(account)
-                result = _extract_result(
-                    self._delegate(account_server.server, "calendars_list", {})
-                )
+                result = self._delegate(account_server.server, "calendars_list", {})
                 self._merge_private_values(private_values, result)
                 for calendar in result["structuredContent"]["calendars"]:
                     calendar_copy = dict(calendar)
@@ -443,9 +466,9 @@ class GatewayCalendarMCP:
                 }
                 if "limit" in arguments:
                     delegated_arguments["limit"] = arguments["limit"]
-                result = _extract_result(
-                    self._delegate(account_server.server, "free_busy", delegated_arguments)
-                )["structuredContent"]
+                result = self._delegate(account_server.server, "free_busy", delegated_arguments)[
+                    "structuredContent"
+                ]
                 truncated = truncated or bool(result.get("truncated"))
                 for interval in result["busy"]:
                     intervals.append((_parse_utc(interval["start"]), _parse_utc(interval["end"])))
@@ -594,26 +617,14 @@ class GatewayCalendarMCP:
     def _delegate(
         server: PrivateCalendarMCPServer, name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        response = server.handle(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": arguments},
-            }
-        )
-        if response is None:
-            raise RuntimeError("Calendar server returned no response")
-        if "error" in response:
-            error = response["error"]
-            code = error.get("code")
-            message = error.get("message", "Calendar operation failed")
-            if code == -32001:
-                raise PermissionError(message)
-            if code == -32602:
-                raise ValueError(message)
-            raise RuntimeError(message)
-        return response
+        try:
+            return server.call_tool(name, arguments)
+        except MCPToolCallFailure as exc:
+            if exc.code == -32001:
+                raise PermissionError(exc.message) from exc
+            if exc.code == -32602:
+                raise ValueError(exc.message) from exc
+            raise RuntimeError(exc.message) from exc
 
     @staticmethod
     def _merge_private_values(target: dict[str, str], result: dict[str, Any]) -> None:
@@ -722,13 +733,6 @@ def _decode_calendar_reference(
         ),
         expires_at,
     )
-
-
-def _extract_result(response: dict[str, Any]) -> dict[str, Any]:
-    result = response.get("result")
-    if not isinstance(result, dict):
-        raise RuntimeError("Calendar server returned an invalid result")
-    return result
 
 
 def _private_result(

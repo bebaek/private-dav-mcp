@@ -27,7 +27,7 @@ from private_dav_mcp.carddav import (
 from private_dav_mcp.gateway_identity import GatewayIdentity
 from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountStore
-from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
+from private_dav_mcp.mcp_sdk import MCPToolCallFailure, build_mcp_sdk_server
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION
 
 _CONTACT_WRITE_TOOLS = {"contacts_create", "contacts_update", "contacts_delete"}
@@ -111,8 +111,23 @@ class GatewayContactsMCP:
                 CONTACTS_DELETE_TOOL,
                 CONTACTS_PROTECT_TEXT_TOOL,
             ],
-            handler=lambda payload: self.handle(identity, payload),
+            tool_handler=lambda name, arguments: self.call_tool(identity, name, arguments),
         )
+
+    def call_tool(
+        self,
+        identity: GatewayIdentity,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            identity.require(
+                "dav:contacts:write" if name in _CONTACT_WRITE_TOOLS else "dav:contacts:read"
+            )
+            server = self._server_for(identity)
+        except PermissionError as exc:
+            raise MCPToolCallFailure(-32001, str(exc)) from exc
+        return server.call_tool(name, arguments)
 
     def handle(self, identity: GatewayIdentity, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")

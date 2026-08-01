@@ -18,7 +18,11 @@ from fastapi import FastAPI
 
 from private_dav_mcp import __version__
 from private_dav_mcp.mcp_http import create_mcp_app
-from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
+from private_dav_mcp.mcp_sdk import (
+    MCPToolCallFailure,
+    build_mcp_sdk_server,
+    extract_mcp_tool_result,
+)
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 from private_dav_mcp.webdav import (
     DAV_READINESS_TIMEOUT_SECONDS,
@@ -526,6 +530,16 @@ class PrivateContactsMCPServer:
 
     def check_ready(self) -> None:
         self._contact_source.check_ready()
+
+    def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            response = self._handle_tool_call(
+                1,
+                {"name": name, "arguments": arguments},
+            )
+        except Exception as exc:
+            raise MCPToolCallFailure(-32000, str(exc)) from exc
+        return extract_mcp_tool_result(response)
 
     def handle(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")
@@ -1231,7 +1245,7 @@ def create_app(server: PrivateContactsMCPServer | None = None) -> FastAPI:
                 CONTACTS_DELETE_TOOL,
                 CONTACTS_PROTECT_TEXT_TOOL,
             ],
-            handler=private_contacts.handle,
+            tool_handler=private_contacts.call_tool,
         ),
         readiness_check=private_contacts.check_ready,
     )
