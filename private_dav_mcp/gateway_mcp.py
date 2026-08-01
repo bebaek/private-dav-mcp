@@ -36,9 +36,8 @@ from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 from private_dav_mcp.mcp_sdk import (
     MCPToolCallFailure,
     build_mcp_sdk_server,
-    extract_mcp_tool_result,
 )
-from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
+from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 
 CALENDAR_ACCOUNTS_LIST_TOOL = {
     "name": "calendar_accounts_list",
@@ -260,12 +259,38 @@ class GatewayCalendarMCP:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         try:
-            response = self._handle_tool_call(
-                identity,
-                1,
-                {"name": name, "arguments": arguments},
-            )
-            return extract_mcp_tool_result(response)
+            if name in {"events_create", "events_update", "events_delete"}:
+                identity.require("dav:calendar:write")
+            else:
+                identity.require("dav:calendar:read")
+            if name == "calendar_accounts_list":
+                return self._accounts_list(identity, arguments)
+            if name == "calendars_list":
+                return self._calendars_list(identity, arguments)
+            if name == "free_busy":
+                return self._free_busy(identity, arguments)
+            if name in {"events_list", "events_create"}:
+                reference_type = "calendar"
+                reference_name = "calendar_ref"
+            elif name in {"events_get", "events_update", "events_delete"}:
+                reference_type = "event"
+                reference_name = "event_ref"
+            else:
+                raise ValueError(f"Unknown tool: {name}")
+            reference = arguments.get(reference_name)
+            if not isinstance(reference, str) or not reference:
+                raise ValueError(f"{name} requires {reference_name}")
+            account, account_server = self._resolve_route(identity, reference, reference_type)
+            if account.kind == "ics" and name in {
+                "events_create",
+                "events_update",
+                "events_delete",
+            }:
+                raise PermissionError("ICS calendar subscriptions are read-only")
+            result = self._delegate(account_server.server, name, arguments)
+            if name in {"events_list", "events_create"}:
+                self._record_event_references(identity, account, result)
+            return result
         except MCPToolCallFailure:
             raise
         except PermissionError as exc:
@@ -275,77 +300,8 @@ class GatewayCalendarMCP:
         except Exception as exc:
             raise MCPToolCallFailure(-32000, "Calendar operation failed") from exc
 
-    def handle(self, identity: GatewayIdentity, payload: dict[str, Any]) -> dict[str, Any] | None:
-        request_id = payload.get("id")
-        method = payload.get("method")
-        if method == "notifications/initialized" or request_id is None:
-            return None
-        if method == "initialize":
-            return _result(
-                request_id,
-                {
-                    "protocolVersion": DEFAULT_MCP_PROTOCOL_VERSION,
-                    "serverInfo": {"name": "private-dav-gateway", "version": __version__},
-                    "capabilities": {"tools": {}},
-                },
-            )
-        if method == "tools/list":
-            return _result(request_id, {"tools": GATEWAY_CALENDAR_TOOLS})
-        if method != "tools/call":
-            return _error(request_id, -32601, f"Unsupported MCP method '{method}'")
-        try:
-            return self._handle_tool_call(identity, request_id, payload.get("params"))
-        except PermissionError as exc:
-            return _error(request_id, -32001, str(exc))
-        except (TypeError, ValueError) as exc:
-            return _error(request_id, -32602, str(exc))
-        except Exception:
-            return _error(request_id, -32000, "Calendar operation failed")
-
-    def _handle_tool_call(
-        self, identity: GatewayIdentity, request_id: Any, params: Any
-    ) -> dict[str, Any]:
-        if not isinstance(params, dict):
-            raise TypeError("tools/call params must be an object")
-        name = params.get("name")
-        arguments = params.get("arguments") or {}
-        if not isinstance(name, str) or not isinstance(arguments, dict):
-            raise TypeError("tools/call requires name and object arguments")
-        if name in {"events_create", "events_update", "events_delete"}:
-            identity.require("dav:calendar:write")
-        else:
-            identity.require("dav:calendar:read")
-        if name == "calendar_accounts_list":
-            return self._accounts_list(identity, request_id, arguments)
-        if name == "calendars_list":
-            return self._calendars_list(identity, request_id, arguments)
-        if name == "free_busy":
-            return self._free_busy(identity, request_id, arguments)
-        if name in {"events_list", "events_create"}:
-            reference_type = "calendar"
-            reference_name = "calendar_ref"
-        elif name in {"events_get", "events_update", "events_delete"}:
-            reference_type = "event"
-            reference_name = "event_ref"
-        else:
-            raise ValueError(f"Unknown tool: {name}")
-        reference = arguments.get(reference_name)
-        if not isinstance(reference, str) or not reference:
-            raise ValueError(f"{name} requires {reference_name}")
-        account, account_server = self._resolve_route(identity, reference, reference_type)
-        if account.kind == "ics" and name in {
-            "events_create",
-            "events_update",
-            "events_delete",
-        }:
-            raise PermissionError("ICS calendar subscriptions are read-only")
-        result = self._delegate(account_server.server, name, arguments)
-        if name in {"events_list", "events_create"}:
-            self._record_event_references(identity, account, result)
-        return {"jsonrpc": "2.0", "id": request_id, "result": result}
-
     def _accounts_list(
-        self, identity: GatewayIdentity, request_id: Any, arguments: dict[str, Any]
+        self, identity: GatewayIdentity, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         if arguments:
             raise ValueError("calendar_accounts_list accepts no arguments")
@@ -372,14 +328,13 @@ class GatewayCalendarMCP:
                 }
             )
         return _private_result(
-            request_id,
             {"accounts": accounts},
             private_values,
             f"Found {len(accounts)} enabled calendar accounts.",
         )
 
     def _calendars_list(
-        self, identity: GatewayIdentity, request_id: Any, arguments: dict[str, Any]
+        self, identity: GatewayIdentity, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         if not set(arguments) <= {"account_ref"}:
             raise ValueError("calendars_list accepts only account_ref")
@@ -412,7 +367,6 @@ class GatewayCalendarMCP:
             except Exception:
                 failed += 1
         return _private_result(
-            request_id,
             {
                 "calendars": calendars,
                 "partial": failed > 0,
@@ -422,9 +376,7 @@ class GatewayCalendarMCP:
             f"Found {len(calendars)} calendars.",
         )
 
-    def _free_busy(
-        self, identity: GatewayIdentity, request_id: Any, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _free_busy(self, identity: GatewayIdentity, arguments: dict[str, Any]) -> dict[str, Any]:
         allowed = {"calendar_ref", "calendar_refs", "start", "end", "limit"}
         if not set(arguments) <= allowed or "start" not in arguments or "end" not in arguments:
             raise ValueError("free_busy requires start and end with optional calendar references")
@@ -449,10 +401,8 @@ class GatewayCalendarMCP:
                 raise ValueError("calendar_refs must contain 1 to 100 unique references")
             references = multiple
         else:
-            listed = self._calendars_list(identity, request_id, {})
-            references = [
-                item["calendar_ref"] for item in listed["result"]["structuredContent"]["calendars"]
-            ]
+            listed = self._calendars_list(identity, {})
+            references = [item["calendar_ref"] for item in listed["structuredContent"]["calendars"]]
         intervals: list[tuple[datetime, datetime]] = []
         failed = 0
         truncated = False
@@ -475,13 +425,12 @@ class GatewayCalendarMCP:
             except Exception:
                 failed += 1
         if references and failed == len(references):
-            return _error(request_id, -32002, "All selected calendars are unavailable")
+            raise MCPToolCallFailure(-32002, "All selected calendars are unavailable")
         merged = _merge_intervals(intervals)
         output = [
             {"start": _format_utc(start), "end": _format_utc(end)} for start, end in merged[:limit]
         ]
         return _private_result(
-            request_id,
             {
                 "busy": output,
                 "truncated": truncated or len(merged) > limit,
@@ -736,27 +685,15 @@ def _decode_calendar_reference(
 
 
 def _private_result(
-    request_id: Any,
     structured_content: dict[str, Any],
     private_values: dict[str, str],
     message: str,
 ) -> dict[str, Any]:
-    return _result(
-        request_id,
-        {
-            "content": [{"type": "text", "text": message}],
-            "structuredContent": structured_content,
-            "_meta": {PRIVATE_VALUES_META_KEY: private_values},
-        },
-    )
-
-
-def _result(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": request_id, "result": result}
-
-
-def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+    return {
+        "content": [{"type": "text", "text": message}],
+        "structuredContent": structured_content,
+        "_meta": {PRIVATE_VALUES_META_KEY: private_values},
+    }
 
 
 def _validate_window(start_value: Any, end_value: Any) -> tuple[datetime, datetime]:

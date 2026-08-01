@@ -16,6 +16,7 @@ from private_dav_mcp.carddav import (
     parse_carddav_multistatus_resources,
     parse_vcard,
 )
+from private_dav_mcp.mcp_sdk import MCPToolCallFailure
 from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 
 
@@ -226,17 +227,10 @@ def test_private_contacts_server_lists_refs_then_gets_selected_private_fields() 
         contact_reference_factory=lambda: "contact-ref",
     )
 
-    listed = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "contacts_list", "arguments": {}},
-        }
-    )
+    listed = server.call_tool("contacts_list", {})
 
     assert listed is not None
-    listed_result = listed["result"]
+    listed_result = listed
     assert listed_result["structuredContent"] == {
         "contacts": [
             {
@@ -249,23 +243,16 @@ def test_private_contacts_server_lists_refs_then_gets_selected_private_fields() 
     }
     assert listed_result["_meta"][PRIVATE_VALUES_META_KEY] == {"name-ref": "Alice Smith"}
 
-    fetched = server.handle(
+    fetched = server.call_tool(
+        "contacts_get",
         {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_get",
-                "arguments": {
-                    "contact_ref": "contact-ref",
-                    "fields": ["emails", "phones"],
-                },
-            },
-        }
+            "contact_ref": "contact-ref",
+            "fields": ["emails", "phones"],
+        },
     )
 
     assert fetched is not None
-    fetched_result = fetched["result"]
+    fetched_result = fetched
     assert fetched_result["structuredContent"] == {
         "contact_ref": "contact-ref",
         "emails": ["{{pii:email:email-ref}}"],
@@ -285,20 +272,10 @@ def test_private_contacts_server_protects_unique_contact_names_for_model_input()
         contact_reference_factory=lambda: "contact-ref",
     )
 
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_protect_text",
-                "arguments": {"text": "What is Alice Smith's email?"},
-            },
-        }
-    )
+    response = server.call_tool("contacts_protect_text", {"text": "What is Alice Smith's email?"})
 
     assert response is not None
-    result = response["result"]
+    result = response
     assert result["structuredContent"] == {
         "text": "What is {{pii:contact:contact-ref}}'s email?",
         "protected_contact_count": 1,
@@ -313,20 +290,12 @@ def test_private_contacts_server_protects_unambiguous_first_and_last_names() -> 
         contact_reference_factory=lambda: "contact-ref",
     )
 
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_protect_text",
-                "arguments": {"text": "Show me Gabe's email, then call Zurita."},
-            },
-        }
+    response = server.call_tool(
+        "contacts_protect_text", {"text": "Show me Gabe's email, then call Zurita."}
     )
 
     assert response is not None
-    result = response["result"]
+    result = response
     assert result["structuredContent"] == {
         "text": (
             "Show me {{pii:contact:contact-ref}}'s email, then call {{pii:contact:contact-ref}}."
@@ -339,20 +308,10 @@ def test_private_contacts_server_protects_unambiguous_first_and_last_names() -> 
 def test_private_contacts_server_does_not_protect_partial_name_without_contact_context() -> None:
     server = PrivateContactsMCPServer(contacts=[Contact(name="Will Smith")])
 
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_protect_text",
-                "arguments": {"text": "Will this work in May?"},
-            },
-        }
-    )
+    response = server.call_tool("contacts_protect_text", {"text": "Will this work in May?"})
 
     assert response is not None
-    result = response["result"]
+    result = response
     assert result["structuredContent"] == {
         "text": "Will this work in May?",
         "protected_contact_count": 0,
@@ -365,20 +324,10 @@ def test_private_contacts_server_does_not_guess_ambiguous_partial_names() -> Non
         contacts=[Contact(name="Alex Doe"), Contact(name="Alex Smith")]
     )
 
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_protect_text",
-                "arguments": {"text": "Call Alex"},
-            },
-        }
-    )
+    response = server.call_tool("contacts_protect_text", {"text": "Call Alex"})
 
     assert response is not None
-    result = response["result"]
+    result = response
     assert result["structuredContent"] == {
         "text": "Call Alex",
         "protected_contact_count": 0,
@@ -389,20 +338,10 @@ def test_private_contacts_server_does_not_guess_ambiguous_partial_names() -> Non
 def test_private_contacts_server_does_not_guess_ambiguous_contact_names() -> None:
     server = PrivateContactsMCPServer(contacts=[Contact(name="Alex Doe"), Contact(name="Alex Doe")])
 
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_protect_text",
-                "arguments": {"text": "Call Alex Doe"},
-            },
-        }
-    )
+    response = server.call_tool("contacts_protect_text", {"text": "Call Alex Doe"})
 
     assert response is not None
-    result = response["result"]
+    result = response
     assert result["structuredContent"] == {
         "text": "Call Alex Doe",
         "protected_contact_count": 0,
@@ -418,31 +357,14 @@ def test_private_contacts_server_expires_contact_references() -> None:
         contact_reference_ttl_seconds=5,
         clock=lambda: now[0],
     )
-    server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "contacts_list", "arguments": {}},
-        }
-    )
+    server.call_tool("contacts_list", {})
     now[0] = 106.0
 
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_get",
-                "arguments": {"contact_ref": "contact-ref", "fields": ["emails"]},
-            },
-        }
-    )
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        server.call_tool("contacts_get", {"contact_ref": "contact-ref", "fields": ["emails"]})
 
-    assert response is not None
-    assert response["error"]["code"] == -32001
-    assert response["error"]["message"] == "Unknown or expired contact_ref"
+    assert exc_info.value.code == -32001
+    assert exc_info.value.message == "Unknown or expired contact_ref"
 
 
 def test_parse_carddav_resources_keeps_href_etag_uid_and_raw_vcard() -> None:
@@ -563,65 +485,31 @@ def test_private_contacts_server_supports_create_update_delete() -> None:
         contact_reference_factory=lambda: next(references),
     )
 
-    created = server.handle(
+    created = server.call_tool(
+        "contacts_create",
         {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_create",
-                "arguments": {
-                    "name": "Jane Doe",
-                    "emails": ["jane@example.com"],
-                    "phones": ["+1 555 0102"],
-                },
-            },
-        }
+            "name": "Jane Doe",
+            "emails": ["jane@example.com"],
+            "phones": ["+1 555 0102"],
+        },
     )
     assert created is not None
-    assert created["result"]["structuredContent"] == {
+    assert created["structuredContent"] == {
         "status": "created",
         "contact_ref": "created-ref",
     }
 
-    updated = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_update",
-                "arguments": {"contact_ref": "created-ref", "emails": []},
-            },
-        }
-    )
+    updated = server.call_tool("contacts_update", {"contact_ref": "created-ref", "emails": []})
     assert updated is not None
-    assert updated["result"]["structuredContent"]["status"] == "updated"
+    assert updated["structuredContent"]["status"] == "updated"
 
-    listed = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "contacts_list", "arguments": {}},
-        }
-    )
+    listed = server.call_tool("contacts_list", {})
     assert listed is not None
-    assert listed["result"]["structuredContent"]["contacts"][0]["available_fields"] == ["phones"]
+    assert listed["structuredContent"]["contacts"][0]["available_fields"] == ["phones"]
 
-    deleted = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_delete",
-                "arguments": {"contact_ref": "created-ref"},
-            },
-        }
-    )
+    deleted = server.call_tool("contacts_delete", {"contact_ref": "created-ref"})
     assert deleted is not None
-    assert deleted["result"]["structuredContent"] == {"status": "deleted"}
+    assert deleted["structuredContent"] == {"status": "deleted"}
 
 
 def _addressbook_discovery_response() -> httpx.Response:

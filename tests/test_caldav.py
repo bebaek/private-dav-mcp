@@ -20,6 +20,7 @@ from private_dav_mcp.caldav import (
     patch_icalendar,
     serialize_icalendar,
 )
+from private_dav_mcp.mcp_sdk import MCPToolCallFailure
 from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 
 
@@ -645,37 +646,22 @@ def test_private_calendar_mcp_enforces_query_and_recurring_series_scope() -> Non
     )
     _call(server, "calendars_list", {})
 
-    missing_end = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "events_list",
-                "arguments": {"calendar_ref": "calendar-ref", "start": "2026-03-01T00:00:00Z"},
-            },
-        }
-    )
-    assert missing_end is not None
-    assert missing_end["error"]["code"] == -32602
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        server.call_tool(
+            "events_list",
+            {"calendar_ref": "calendar-ref", "start": "2026-03-01T00:00:00Z"},
+        )
+    assert exc_info.value.code == -32602
 
-    excessive_range = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "events_list",
-                "arguments": {
-                    "calendar_ref": "calendar-ref",
-                    "start": "2026-01-01T00:00:00Z",
-                    "end": "2028-01-01T00:00:00Z",
-                },
+    with pytest.raises(MCPToolCallFailure, match="must not exceed"):
+        server.call_tool(
+            "events_list",
+            {
+                "calendar_ref": "calendar-ref",
+                "start": "2026-01-01T00:00:00Z",
+                "end": "2028-01-01T00:00:00Z",
             },
-        }
-    )
-    assert excessive_range is not None
-    assert "must not exceed" in excessive_range["error"]["message"]
+        )
 
     _call(
         server,
@@ -686,39 +672,20 @@ def test_private_calendar_mcp_enforces_query_and_recurring_series_scope() -> Non
             "end": "2026-03-02T00:00:00Z",
         },
     )
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "events_update",
-                "arguments": {"event_ref": "event-ref", "summary": "Changed"},
-            },
-        }
-    )
-    assert response is not None
-    assert response["error"]["code"] == -32602
-    assert "scope=series" in response["error"]["message"]
+    with pytest.raises(MCPToolCallFailure, match="scope=series") as exc_info:
+        server.call_tool("events_update", {"event_ref": "event-ref", "summary": "Changed"})
+    assert exc_info.value.code == -32602
 
-    temporal_response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "events_update",
-                "arguments": {
-                    "event_ref": "event-ref",
-                    "scope": "series",
-                    "start": "2026-03-01T11:00:00Z",
-                    "end": "2026-03-01T12:00:00Z",
-                },
+    with pytest.raises(MCPToolCallFailure, match="time updates are not supported"):
+        server.call_tool(
+            "events_update",
+            {
+                "event_ref": "event-ref",
+                "scope": "series",
+                "start": "2026-03-01T11:00:00Z",
+                "end": "2026-03-01T12:00:00Z",
             },
-        }
-    )
-    assert temporal_response is not None
-    assert "time updates are not supported" in temporal_response["error"]["message"]
+        )
 
     updated = _call(
         server,
@@ -727,16 +694,8 @@ def test_private_calendar_mcp_enforces_query_and_recurring_series_scope() -> Non
     )
     assert updated["structuredContent"]["status"] == "updated"
 
-    delete_without_scope = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {"name": "events_delete", "arguments": {"event_ref": "event-ref"}},
-        }
-    )
-    assert delete_without_scope is not None
-    assert "scope=series" in delete_without_scope["error"]["message"]
+    with pytest.raises(MCPToolCallFailure, match="scope=series"):
+        server.call_tool("events_delete", {"event_ref": "event-ref"})
 
     deleted = _call(
         server,
@@ -747,16 +706,7 @@ def test_private_calendar_mcp_enforces_query_and_recurring_series_scope() -> Non
 
 
 def _call(server: PrivateCalendarMCPServer, name: str, arguments: dict[str, object]) -> dict:
-    response = server.handle(
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": arguments},
-        }
-    )
-    assert response is not None and "result" in response, response
-    return response["result"]
+    return server.call_tool(name, arguments)
 
 
 def _calendar_discovery_response() -> httpx.Response:

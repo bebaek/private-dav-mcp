@@ -46,7 +46,7 @@ from private_dav_mcp.gateway_mcp import (
 from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
-from private_dav_mcp.mcp_sdk import SDK_MCP_PROTOCOL_VERSION
+from private_dav_mcp.mcp_sdk import SDK_MCP_PROTOCOL_VERSION, MCPToolCallFailure
 from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 
 ISSUER = "https://minigent.example"
@@ -492,17 +492,9 @@ def test_gateway_reports_per_feed_ics_health(tmp_path: Path) -> None:
     )
 
     def call(name: str) -> dict[str, Any]:
-        response = calendar_gateway.handle(
-            identity,
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": name, "arguments": {}},
-            },
-        )
+        response = calendar_gateway.call_tool(identity, name, {})
         assert response is not None and "error" not in response
-        return response["result"]["structuredContent"]
+        return response["structuredContent"]
 
     call("calendars_list")
     assert call("calendar_accounts_list")["accounts"][0]["status"] == "healthy"
@@ -643,40 +635,16 @@ def test_static_caldav_accounts_are_owner_scoped_without_database_onboarding(
     )
 
     broker.check_ready()
-    owner_accounts = broker.handle(
-        owner,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "calendar_accounts_list", "arguments": {}},
-        },
-    )
+    owner_accounts = broker.call_tool(owner, "calendar_accounts_list", {})
     assert owner_accounts is not None
-    account_ref = owner_accounts["result"]["structuredContent"]["accounts"][0]["account_ref"]
-    other_accounts = broker.handle(
-        other,
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {"name": "calendar_accounts_list", "arguments": {}},
-        },
-    )
+    account_ref = owner_accounts["structuredContent"]["accounts"][0]["account_ref"]
+    other_accounts = broker.call_tool(other, "calendar_accounts_list", {})
     assert other_accounts is not None
-    assert other_accounts["result"]["structuredContent"]["accounts"] == []
+    assert other_accounts["structuredContent"]["accounts"] == []
 
-    calendars = broker.handle(
-        owner,
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "calendars_list", "arguments": {"account_ref": account_ref}},
-        },
-    )
+    calendars = broker.call_tool(owner, "calendars_list", {"account_ref": account_ref})
     assert calendars is not None
-    assert len(calendars["result"]["structuredContent"]["calendars"]) == 1
+    assert len(calendars["structuredContent"]["calendars"]) == 1
     assert seen_accounts[0].credential.password == "environment-secret"
     assert store.list_accounts("tenant-a", "user-a", limit=100) == []
 
@@ -708,59 +676,18 @@ def test_static_carddav_account_is_authenticated_and_owner_scoped() -> None:
         scopes=frozenset({"dav:contacts:read"}),
     )
 
-    listed = broker.handle(
-        owner,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "contacts_list", "arguments": {}},
-        },
-    )
+    listed = broker.call_tool(owner, "contacts_list", {})
     assert listed is not None and "error" not in listed
-    contact_ref = listed["result"]["structuredContent"]["contacts"][0]["contact_ref"]
-    assert "Private Person" not in json.dumps(listed["result"]["structuredContent"])
+    contact_ref = listed["structuredContent"]["contacts"][0]["contact_ref"]
+    assert "Private Person" not in json.dumps(listed["structuredContent"])
 
-    catalog = broker.handle(
-        other,
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-    )
-    assert catalog is not None
-    assert [tool["name"] for tool in catalog["result"]["tools"]] == [
-        "contacts_list",
-        "contacts_get",
-        "contacts_create",
-        "contacts_update",
-        "contacts_delete",
-        "contacts_protect_text",
-    ]
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        broker.call_tool(other, "contacts_get", {"contact_ref": contact_ref, "fields": ["emails"]})
+    assert exc_info.value.code == -32001
 
-    cross_owner = broker.handle(
-        other,
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_get",
-                "arguments": {"contact_ref": contact_ref, "fields": ["emails"]},
-            },
-        },
-    )
-    assert cross_owner is not None
-    assert cross_owner["error"]["code"] == -32001
-
-    denied_write = broker.handle(
-        owner,
-        {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {"name": "contacts_create", "arguments": {"name": "New Person"}},
-        },
-    )
-    assert denied_write is not None
-    assert denied_write["error"]["code"] == -32001
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        broker.call_tool(owner, "contacts_create", {"name": "New Person"})
+    assert exc_info.value.code == -32001
 
 
 def test_durable_references_resolve_across_gateway_instances(tmp_path: Path) -> None:
@@ -814,28 +741,11 @@ def test_durable_references_resolve_across_gateway_instances(tmp_path: Path) -> 
         store=new_store(),
         server_factory=contact_factory,
     )
-    listed_contacts = contacts_a.handle(
-        identity,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {"name": "contacts_list", "arguments": {}},
-        },
-    )
+    listed_contacts = contacts_a.call_tool(identity, "contacts_list", {})
     assert listed_contacts is not None and "error" not in listed_contacts
-    contact_ref = listed_contacts["result"]["structuredContent"]["contacts"][0]["contact_ref"]
-    selected_contact = contacts_b.handle(
-        identity,
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "contacts_get",
-                "arguments": {"contact_ref": contact_ref, "fields": ["emails"]},
-            },
-        },
+    contact_ref = listed_contacts["structuredContent"]["contacts"][0]["contact_ref"]
+    selected_contact = contacts_b.call_tool(
+        identity, "contacts_get", {"contact_ref": contact_ref, "fields": ["emails"]}
     )
     assert selected_contact is not None and "error" not in selected_contact
 
@@ -880,46 +790,22 @@ def test_durable_references_resolve_across_gateway_instances(tmp_path: Path) -> 
     calendars_b = GatewayCalendarMCP(
         new_store(), static_accounts=(calendar_template,), server_factory=calendar_factory
     )
-    listed_calendars = calendars_a.handle(
-        identity,
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "calendars_list", "arguments": {}},
-        },
-    )
+    listed_calendars = calendars_a.call_tool(identity, "calendars_list", {})
     assert listed_calendars is not None and "error" not in listed_calendars
-    calendar_ref = listed_calendars["result"]["structuredContent"]["calendars"][0]["calendar_ref"]
-    listed_events = calendars_b.handle(
+    calendar_ref = listed_calendars["structuredContent"]["calendars"][0]["calendar_ref"]
+    listed_events = calendars_b.call_tool(
         identity,
+        "events_list",
         {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {
-                "name": "events_list",
-                "arguments": {
-                    "calendar_ref": calendar_ref,
-                    "start": "2026-08-01T00:00:00Z",
-                    "end": "2026-08-02T00:00:00Z",
-                },
-            },
+            "calendar_ref": calendar_ref,
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-02T00:00:00Z",
         },
     )
     assert listed_events is not None and "error" not in listed_events
-    event_ref = listed_events["result"]["structuredContent"]["events"][0]["event_ref"]
-    selected_event = calendars_a.handle(
-        identity,
-        {
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": {
-                "name": "events_get",
-                "arguments": {"event_ref": event_ref, "fields": ["description"]},
-            },
-        },
+    event_ref = listed_events["structuredContent"]["events"][0]["event_ref"]
+    selected_event = calendars_a.call_tool(
+        identity, "events_get", {"event_ref": event_ref, "fields": ["description"]}
     )
     assert selected_event is not None and "error" not in selected_event
 

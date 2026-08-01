@@ -8,7 +8,7 @@ import xml.etree.ElementTree as ET
 from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
-from typing import Any, Protocol
+from typing import Any, Never, Protocol
 from urllib.parse import quote, urljoin, urlsplit
 from uuid import uuid4
 from xml.sax.saxutils import escape
@@ -25,9 +25,8 @@ from private_dav_mcp.mcp_http import create_mcp_app
 from private_dav_mcp.mcp_sdk import (
     MCPToolCallFailure,
     build_mcp_sdk_server,
-    extract_mcp_tool_result,
 )
-from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
+from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 from private_dav_mcp.webdav import (
     DAV_READINESS_TIMEOUT_SECONDS,
     DAVHTTPClient,
@@ -723,57 +722,6 @@ class PrivateCalendarMCPServer:
         return status if isinstance(status, str) else "configured"
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        try:
-            response = self._handle_tool_call(
-                1,
-                {"name": name, "arguments": arguments},
-            )
-        except Exception as exc:
-            raise MCPToolCallFailure(-32000, str(exc)) from exc
-        return extract_mcp_tool_result(response)
-
-    def handle(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        request_id = payload.get("id")
-        method = payload.get("method")
-        if method == "notifications/initialized" or request_id is None:
-            return None
-        if method == "initialize":
-            return self._result(
-                request_id,
-                {
-                    "protocolVersion": DEFAULT_MCP_PROTOCOL_VERSION,
-                    "serverInfo": {"name": "minigent-private-calendar", "version": __version__},
-                    "capabilities": {"tools": {}},
-                },
-            )
-        if method == "tools/list":
-            return self._result(
-                request_id,
-                {
-                    "tools": [
-                        CALENDARS_LIST_TOOL,
-                        EVENTS_LIST_TOOL,
-                        EVENTS_GET_TOOL,
-                        FREE_BUSY_TOOL,
-                        EVENTS_CREATE_TOOL,
-                        EVENTS_UPDATE_TOOL,
-                        EVENTS_DELETE_TOOL,
-                    ]
-                },
-            )
-        if method == "tools/call":
-            try:
-                return self._handle_tool_call(request_id, payload.get("params"))
-            except Exception as exc:
-                return self._error(request_id, -32000, str(exc))
-        return self._error(request_id, -32601, f"Unsupported MCP method '{method}'")
-
-    def _handle_tool_call(self, request_id: Any, params: Any) -> dict[str, Any]:
-        if not isinstance(params, dict):
-            return self._error(request_id, -32602, "tools/call params must be an object")
-        arguments = params.get("arguments") or {}
-        if not isinstance(arguments, dict):
-            return self._error(request_id, -32602, "tool arguments must be an object")
         handlers = {
             "calendars_list": self._handle_calendars_list,
             "events_list": self._handle_events_list,
@@ -783,15 +731,19 @@ class PrivateCalendarMCPServer:
             "events_update": self._handle_events_update,
             "events_delete": self._handle_events_delete,
         }
-        tool_name = params.get("name")
-        handler = handlers.get(tool_name) if isinstance(tool_name, str) else None
+        handler = handlers.get(name)
         if handler is None:
-            return self._error(request_id, -32602, "Unknown tool")
-        return handler(request_id, arguments)
+            return _tool_error(-32602, "Unknown tool")
+        try:
+            return handler(arguments)
+        except MCPToolCallFailure:
+            raise
+        except Exception as exc:
+            raise MCPToolCallFailure(-32000, str(exc)) from exc
 
-    def _handle_calendars_list(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_calendars_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if arguments:
-            return self._error(request_id, -32602, "calendars_list accepts no arguments")
+            return _tool_error(-32602, "calendars_list accepts no arguments")
         self._prune()
         private_values: dict[str, str] = {}
         calendars = []
@@ -803,20 +755,16 @@ class PrivateCalendarMCPServer:
                     "color": calendar.color,
                 }
             )
-        return self._private_result(
-            request_id, {"calendars": calendars}, private_values, "Listed calendars."
-        )
+        return self._private_result({"calendars": calendars}, private_values, "Listed calendars.")
 
-    def _handle_events_list(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_events_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if not {"calendar_ref", "start", "end"} <= set(arguments) or not set(arguments) <= {
             "calendar_ref",
             "start",
             "end",
             "limit",
         }:
-            return self._error(
-                request_id, -32602, "events_list requires calendar_ref, start, and end"
-            )
+            return _tool_error(-32602, "events_list requires calendar_ref, start, and end")
         try:
             calendar = self._resolve(arguments["calendar_ref"], Calendar)
             start = _parse_query_datetime(arguments["start"], field="start")
@@ -827,7 +775,7 @@ class PrivateCalendarMCPServer:
             if (end - start).total_seconds() > MAX_EVENT_QUERY_DAYS * 86_400:
                 raise ValueError(f"event query range must not exceed {MAX_EVENT_QUERY_DAYS} days")
         except (TypeError, ValueError) as exc:
-            return self._error(request_id, -32602, str(exc))
+            return _tool_error(-32602, str(exc))
         resources, truncated = self._source.list_event_resources(
             calendar, start=start, end=end, limit=limit
         )
@@ -856,15 +804,14 @@ class PrivateCalendarMCPServer:
                 }
             )
         return self._private_result(
-            request_id,
             {"events": events, "truncated": truncated},
             private_values,
             f"Found {len(events)} events.",
         )
 
-    def _handle_events_get(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_events_get(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if set(arguments) != {"event_ref", "fields"}:
-            return self._error(request_id, -32602, "events_get requires event_ref and fields")
+            return _tool_error(-32602, "events_get requires event_ref and fields")
         fields = arguments.get("fields")
         allowed = {"description", "location", "attendees"}
         if (
@@ -873,11 +820,11 @@ class PrivateCalendarMCPServer:
             or not all(isinstance(field, str) and field in allowed for field in fields)
             or len(set(fields)) != len(fields)
         ):
-            return self._error(request_id, -32602, "fields must contain unique supported fields")
+            return _tool_error(-32602, "fields must contain unique supported fields")
         try:
             resource = self._resolve(arguments.get("event_ref"), EventResource)
         except (TypeError, ValueError) as exc:
-            return self._error(request_id, -32001, str(exc))
+            return _tool_error(-32001, str(exc))
         private_values: dict[str, str] = {}
         content: dict[str, Any] = {"event_ref": arguments["event_ref"]}
         for field in fields:
@@ -889,19 +836,17 @@ class PrivateCalendarMCPServer:
             else:
                 content[field] = self._protect(field, value, private_values) if value else ""
         return self._private_result(
-            request_id, content, private_values, "Retrieved selected protected event fields."
+            content, private_values, "Retrieved selected protected event fields."
         )
 
-    def _handle_free_busy(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_free_busy(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if not {"calendar_ref", "start", "end"} <= set(arguments) or not set(arguments) <= {
             "calendar_ref",
             "start",
             "end",
             "limit",
         }:
-            return self._error(
-                request_id, -32602, "free_busy requires calendar_ref, start, and end"
-            )
+            return _tool_error(-32602, "free_busy requires calendar_ref, start, and end")
         try:
             calendar = self._resolve(arguments["calendar_ref"], Calendar)
             start = _parse_query_datetime(arguments["start"], field="start")
@@ -912,19 +857,18 @@ class PrivateCalendarMCPServer:
             if (end - start).total_seconds() > MAX_EVENT_QUERY_DAYS * 86_400:
                 raise ValueError(f"free/busy range must not exceed {MAX_EVENT_QUERY_DAYS} days")
         except (TypeError, ValueError) as exc:
-            return self._error(request_id, -32602, str(exc))
+            return _tool_error(-32602, str(exc))
         events, truncated = self._source.list_busy_events(
             calendar, start=start, end=end, limit=limit
         )
         busy = _merge_busy_intervals(events, range_start=start, range_end=end)
         return self._private_result(
-            request_id,
             {"busy": busy, "truncated": truncated},
             {},
             f"Found {len(busy)} busy intervals.",
         )
 
-    def _handle_events_create(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_events_create(self, arguments: dict[str, Any]) -> dict[str, Any]:
         allowed = {
             "calendar_ref",
             "summary",
@@ -938,21 +882,20 @@ class PrivateCalendarMCPServer:
             not {"calendar_ref", "summary", "start", "end"} <= set(arguments)
             or not set(arguments) <= allowed
         ):
-            return self._error(request_id, -32602, "events_create has invalid arguments")
+            return _tool_error(-32602, "events_create has invalid arguments")
         try:
             calendar = self._resolve(arguments["calendar_ref"], Calendar)
             event = _event_from_arguments(arguments)
         except (TypeError, ValueError) as exc:
-            return self._error(request_id, -32602, str(exc))
+            return _tool_error(-32602, str(exc))
         resource = self._source.create_event(calendar, event)
         return self._private_result(
-            request_id,
             {"status": "created", "event_ref": self._cache(resource)},
             {},
             "Created the event.",
         )
 
-    def _handle_events_update(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_events_update(self, arguments: dict[str, Any]) -> dict[str, Any]:
         mutable_fields = {"summary", "start", "end", "description", "location", "attendees"}
         allowed = {"event_ref", "scope", *mutable_fields}
         if (
@@ -960,9 +903,7 @@ class PrivateCalendarMCPServer:
             or not set(arguments) & mutable_fields
             or not set(arguments) <= allowed
         ):
-            return self._error(
-                request_id, -32602, "events_update requires event_ref and at least one field"
-            )
+            return _tool_error(-32602, "events_update requires event_ref and at least one field")
         try:
             resource = self._resolve(arguments["event_ref"], EventResource)
             scope = arguments.get("scope")
@@ -978,28 +919,25 @@ class PrivateCalendarMCPServer:
             patch = _event_patch_from_arguments(arguments)
             apply_event_patch(resource.event, patch)
         except (TypeError, ValueError) as exc:
-            return self._error(request_id, -32602, str(exc))
+            return _tool_error(-32602, str(exc))
         updated = self._source.update_event(resource, patch)
         self._invalidate_resource(resource)
         self._references[arguments["event_ref"]] = CachedReference(
             updated, self._clock() + self._ttl
         )
         return self._private_result(
-            request_id,
             {"status": "updated", "event_ref": arguments["event_ref"]},
             {},
             "Updated the event.",
         )
 
-    def _handle_events_delete(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_events_delete(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if "event_ref" not in arguments or not set(arguments) <= {"event_ref", "scope"}:
-            return self._error(
-                request_id, -32602, "events_delete requires event_ref and optional scope"
-            )
+            return _tool_error(-32602, "events_delete requires event_ref and optional scope")
         try:
             resource = self._resolve(arguments["event_ref"], EventResource)
         except (TypeError, ValueError) as exc:
-            return self._error(request_id, -32001, str(exc))
+            return _tool_error(-32001, str(exc))
         try:
             scope = arguments.get("scope")
             if scope is not None and scope != "series":
@@ -1009,10 +947,10 @@ class PrivateCalendarMCPServer:
             if not resource.event.recurring and scope is not None:
                 raise ValueError("scope is only valid for recurring events")
         except (TypeError, ValueError) as exc:
-            return self._error(request_id, -32602, str(exc))
+            return _tool_error(-32602, str(exc))
         self._source.delete_event(resource)
         self._invalidate_resource(resource)
-        return self._private_result(request_id, {"status": "deleted"}, {}, "Deleted the event.")
+        return self._private_result({"status": "deleted"}, {}, "Deleted the event.")
 
     def _cache(self, value: Calendar | EventResource) -> str:
         self._prune()
@@ -1055,27 +993,19 @@ class PrivateCalendarMCPServer:
 
     def _private_result(
         self,
-        request_id: Any,
         structured_content: dict[str, Any],
         private_values: dict[str, str],
         message: str,
     ) -> dict[str, Any]:
-        return self._result(
-            request_id,
-            {
-                "content": [{"type": "text", "text": message}],
-                "structuredContent": structured_content,
-                "_meta": {PRIVATE_VALUES_META_KEY: private_values},
-            },
-        )
+        return {
+            "content": [{"type": "text", "text": message}],
+            "structuredContent": structured_content,
+            "_meta": {PRIVATE_VALUES_META_KEY: private_values},
+        }
 
-    @staticmethod
-    def _result(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
-    @staticmethod
-    def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
+def _tool_error(code: int, message: str) -> Never:
+    raise MCPToolCallFailure(code, message)
 
 
 def _validate_collection_url(value: str, *, base_url: str) -> None:

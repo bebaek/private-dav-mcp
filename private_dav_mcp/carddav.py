@@ -8,7 +8,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, MutableMapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Never, Protocol
 from urllib.parse import quote, urljoin, urlsplit
 from uuid import uuid4
 
@@ -21,9 +21,8 @@ from private_dav_mcp.mcp_http import create_mcp_app
 from private_dav_mcp.mcp_sdk import (
     MCPToolCallFailure,
     build_mcp_sdk_server,
-    extract_mcp_tool_result,
 )
-from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
+from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 from private_dav_mcp.webdav import (
     DAV_READINESS_TIMEOUT_SECONDS,
     DAVHTTPClient,
@@ -532,88 +531,35 @@ class PrivateContactsMCPServer:
         self._contact_source.check_ready()
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        handlers = {
+            "contacts_list": self._handle_contacts_list,
+            "contacts_get": self._handle_contacts_get,
+            "contacts_create": self._handle_contacts_create,
+            "contacts_update": self._handle_contacts_update,
+            "contacts_delete": self._handle_contacts_delete,
+            "contacts_protect_text": self._handle_contacts_protect_text,
+        }
+        handler = handlers.get(name)
+        if handler is None:
+            return _tool_error(-32602, "Unknown tool")
         try:
-            response = self._handle_tool_call(
-                1,
-                {"name": name, "arguments": arguments},
-            )
+            return handler(arguments)
+        except MCPToolCallFailure:
+            raise
         except Exception as exc:
             raise MCPToolCallFailure(-32000, str(exc)) from exc
-        return extract_mcp_tool_result(response)
 
-    def handle(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        request_id = payload.get("id")
-        method = payload.get("method")
-        if method == "notifications/initialized":
-            return None
-        if request_id is None:
-            return None
-        if method == "initialize":
-            return self._result(
-                request_id,
-                {
-                    "protocolVersion": DEFAULT_MCP_PROTOCOL_VERSION,
-                    "serverInfo": {
-                        "name": "minigent-private-contacts",
-                        "version": __version__,
-                    },
-                    "capabilities": {"tools": {}},
-                },
-            )
-        if method == "tools/list":
-            return self._result(
-                request_id,
-                {
-                    "tools": [
-                        CONTACTS_LIST_TOOL,
-                        CONTACTS_GET_TOOL,
-                        CONTACTS_CREATE_TOOL,
-                        CONTACTS_UPDATE_TOOL,
-                        CONTACTS_DELETE_TOOL,
-                        CONTACTS_PROTECT_TEXT_TOOL,
-                    ]
-                },
-            )
-        if method == "tools/call":
-            try:
-                return self._handle_tool_call(request_id, payload.get("params"))
-            except Exception as exc:
-                return self._error(request_id, -32000, str(exc))
-        return self._error(request_id, -32601, f"Unsupported MCP method '{method}'")
-
-    def _handle_tool_call(self, request_id: Any, params: Any) -> dict[str, Any]:
-        if not isinstance(params, dict):
-            return self._error(request_id, -32602, "tools/call params must be an object")
-        arguments = params.get("arguments") or {}
-        if not isinstance(arguments, dict):
-            return self._error(request_id, -32602, "tool arguments must be an object")
-        tool_name = params.get("name")
-        if tool_name == "contacts_list":
-            return self._handle_contacts_list(request_id, arguments)
-        if tool_name == "contacts_get":
-            return self._handle_contacts_get(request_id, arguments)
-        if tool_name == "contacts_create":
-            return self._handle_contacts_create(request_id, arguments)
-        if tool_name == "contacts_update":
-            return self._handle_contacts_update(request_id, arguments)
-        if tool_name == "contacts_delete":
-            return self._handle_contacts_delete(request_id, arguments)
-        if tool_name == "contacts_protect_text":
-            return self._handle_contacts_protect_text(request_id, arguments)
-        return self._error(request_id, -32602, "Unknown tool")
-
-    def _handle_contacts_list(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_contacts_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
         unknown_arguments = set(arguments) - {"limit"}
         if unknown_arguments:
-            return self._error(request_id, -32602, "contacts_list received unknown arguments")
+            return _tool_error(-32602, "contacts_list received unknown arguments")
         limit = arguments.get("limit", DEFAULT_CONTACT_LIMIT)
         if (
             not isinstance(limit, int)
             or isinstance(limit, bool)
             or not 1 <= limit <= MAX_CONTACT_LIMIT
         ):
-            return self._error(
-                request_id,
+            return _tool_error(
                 -32602,
                 f"limit must be an integer from 1 to {MAX_CONTACT_LIMIT}",
             )
@@ -638,38 +584,35 @@ class PrivateContactsMCPServer:
                 }
             )
         return self._private_tool_result(
-            request_id,
             structured_content,
             private_values,
             message=f"Found {len(resources)} contacts.",
         )
 
-    def _handle_contacts_get(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_contacts_get(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if set(arguments) != {"contact_ref", "fields"}:
-            return self._error(
-                request_id,
+            return _tool_error(
                 -32602,
                 "contacts_get requires only contact_ref and fields",
             )
         contact_reference = arguments.get("contact_ref")
         fields = arguments.get("fields")
         if not isinstance(contact_reference, str) or not contact_reference:
-            return self._error(request_id, -32602, "contact_ref must be a non-empty string")
+            return _tool_error(-32602, "contact_ref must be a non-empty string")
         if (
             not isinstance(fields, list)
             or not fields
             or not all(field in {"emails", "phones"} for field in fields)
             or len(set(fields)) != len(fields)
         ):
-            return self._error(
-                request_id,
+            return _tool_error(
                 -32602,
                 "fields must contain unique emails or phones values",
             )
         self._prune_contact_references()
         cached = self._contact_references.get(contact_reference)
         if cached is None:
-            return self._error(request_id, -32001, "Unknown or expired contact_ref")
+            return _tool_error(-32001, "Unknown or expired contact_ref")
 
         private_values: dict[str, str] = {}
         structured_content: dict[str, Any] = {"contact_ref": contact_reference}
@@ -684,52 +627,48 @@ class PrivateContactsMCPServer:
                 for phone in cached.resource.contact.phones
             ]
         return self._private_tool_result(
-            request_id,
             structured_content,
             private_values,
             message="Retrieved the selected protected contact fields.",
         )
 
-    def _handle_contacts_create(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_contacts_create(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if not set(arguments) <= {"name", "emails", "phones"} or "name" not in arguments:
-            return self._error(
-                request_id,
+            return _tool_error(
                 -32602,
                 "contacts_create requires name and accepts only emails and phones",
             )
         try:
             contact = _contact_from_arguments(arguments)
         except ValueError as exc:
-            return self._error(request_id, -32602, str(exc))
+            return _tool_error(-32602, str(exc))
         resource = self._contact_source.create_contact(contact)
         contact_reference = self._cache_contact(resource)
         return self._private_tool_result(
-            request_id,
             {"status": "created", "contact_ref": contact_reference},
             {},
             message="Created the contact.",
         )
 
-    def _handle_contacts_update(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_contacts_update(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if not set(arguments) <= {"contact_ref", "name", "emails", "phones"} or set(arguments) == {
             "contact_ref"
         }:
-            return self._error(
-                request_id,
+            return _tool_error(
                 -32602,
                 "contacts_update requires contact_ref and at least one field to update",
             )
         contact_reference = arguments.get("contact_ref")
         if not isinstance(contact_reference, str) or not contact_reference:
-            return self._error(request_id, -32602, "contact_ref must be a non-empty string")
+            return _tool_error(-32602, "contact_ref must be a non-empty string")
         self._prune_contact_references()
         cached = self._contact_references.get(contact_reference)
         if cached is None:
-            return self._error(request_id, -32001, "Unknown or expired contact_ref")
+            return _tool_error(-32001, "Unknown or expired contact_ref")
         try:
             patch = _contact_patch_from_arguments(arguments)
         except ValueError as exc:
-            return self._error(request_id, -32602, str(exc))
+            return _tool_error(-32602, str(exc))
         updated = self._contact_source.update_contact(cached.resource, patch)
         self._invalidate_resource_references(cached.resource)
         self._contact_references[contact_reference] = CachedContact(
@@ -737,41 +676,35 @@ class PrivateContactsMCPServer:
             expires_at=self._clock() + self._contact_reference_ttl_seconds,
         )
         return self._private_tool_result(
-            request_id,
             {"status": "updated", "contact_ref": contact_reference},
             {},
             message="Updated the contact.",
         )
 
-    def _handle_contacts_delete(self, request_id: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    def _handle_contacts_delete(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if set(arguments) != {"contact_ref"}:
-            return self._error(
-                request_id,
+            return _tool_error(
                 -32602,
                 "contacts_delete requires only contact_ref",
             )
         contact_reference = arguments.get("contact_ref")
         if not isinstance(contact_reference, str) or not contact_reference:
-            return self._error(request_id, -32602, "contact_ref must be a non-empty string")
+            return _tool_error(-32602, "contact_ref must be a non-empty string")
         self._prune_contact_references()
         cached = self._contact_references.get(contact_reference)
         if cached is None:
-            return self._error(request_id, -32001, "Unknown or expired contact_ref")
+            return _tool_error(-32001, "Unknown or expired contact_ref")
         self._contact_source.delete_contact(cached.resource)
         self._invalidate_resource_references(cached.resource)
         return self._private_tool_result(
-            request_id,
             {"status": "deleted"},
             {},
             message="Deleted the contact.",
         )
 
-    def _handle_contacts_protect_text(
-        self, request_id: Any, arguments: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _handle_contacts_protect_text(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if set(arguments) != {"text"} or not isinstance(arguments.get("text"), str):
-            return self._error(
-                request_id,
+            return _tool_error(
                 -32602,
                 "contacts_protect_text requires a text string",
             )
@@ -836,7 +769,6 @@ class PrivateContactsMCPServer:
             )
         protected_count = len(selected)
         return self._private_tool_result(
-            request_id,
             {
                 "text": protected_text,
                 "protected_contact_count": protected_count,
@@ -880,37 +812,25 @@ class PrivateContactsMCPServer:
 
     def _private_tool_result(
         self,
-        request_id: Any,
         structured_content: dict[str, Any],
         private_values: dict[str, str],
         *,
         message: str,
     ) -> dict[str, Any]:
-        return self._result(
-            request_id,
-            {
-                "content": [{"type": "text", "text": message}],
-                "structuredContent": structured_content,
-                "_meta": {PRIVATE_VALUES_META_KEY: private_values},
-            },
-        )
+        return {
+            "content": [{"type": "text", "text": message}],
+            "structuredContent": structured_content,
+            "_meta": {PRIVATE_VALUES_META_KEY: private_values},
+        }
 
     def _protect(self, kind: str, value: str, private_values: dict[str, str]) -> str:
         reference = self._reference_factory()
         private_values[reference] = value
         return f"{{{{pii:{kind}:{reference}}}}}"
 
-    @staticmethod
-    def _result(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
-        return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
-    @staticmethod
-    def _error(request_id: Any, code: int, message: str) -> dict[str, Any]:
-        return {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "error": {"code": code, "message": message},
-        }
+def _tool_error(code: int, message: str) -> Never:
+    raise MCPToolCallFailure(code, message)
 
 
 def _contact_from_arguments(arguments: dict[str, Any]) -> Contact:

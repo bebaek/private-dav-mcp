@@ -24,21 +24,6 @@ class MCPToolCallFailure(RuntimeError):
         self.message = message
 
 
-def extract_mcp_tool_result(response: dict[str, Any]) -> dict[str, Any]:
-    error = response.get("error")
-    if isinstance(error, dict):
-        code = error.get("code")
-        message = error.get("message")
-        raise MCPToolCallFailure(
-            code if isinstance(code, int) else -32000,
-            message if isinstance(message, str) else "MCP tool call failed",
-        )
-    result = response.get("result")
-    if not isinstance(result, dict):
-        raise MCPToolCallFailure(-32603, "MCP tool handler returned an invalid result")
-    return result
-
-
 def build_mcp_sdk_server(
     *,
     name: str,

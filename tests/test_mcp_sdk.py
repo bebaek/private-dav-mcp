@@ -6,7 +6,6 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import anyio
-import pytest
 from fastapi.testclient import TestClient
 from mcp import Client
 from mcp import types as mcp_types
@@ -17,15 +16,9 @@ from private_dav_mcp.mcp_sdk import SDK_MCP_PROTOCOL_VERSION
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 
 
-def test_official_sdk_clients_interoperate_and_preserve_private_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_official_sdk_clients_interoperate_and_preserve_private_metadata() -> None:
     server = PrivateContactsMCPServer()
-
-    def reject_legacy_dispatch(_payload: dict[str, Any]) -> None:
-        raise AssertionError("SDK tool calls must not use legacy JSON-RPC dispatch")
-
-    monkeypatch.setattr(server, "handle", reject_legacy_dispatch)
+    assert not hasattr(server, "handle")
     app = create_app(server)
 
     with TestClient(app) as http_client:
