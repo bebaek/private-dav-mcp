@@ -8,6 +8,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, cast
 
+from mcp.server.lowlevel import Server
+
 from private_dav_mcp import __version__
 from private_dav_mcp.carddav import (
     CONTACTS_CREATE_TOOL,
@@ -25,6 +27,7 @@ from private_dav_mcp.carddav import (
 from private_dav_mcp.gateway_identity import GatewayIdentity
 from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountStore
+from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION
 
 _CONTACT_WRITE_TOOLS = {"contacts_create", "contacts_update", "contacts_delete"}
@@ -95,6 +98,21 @@ class GatewayContactsMCP:
             token_id="__health__",
         )
         self._server_for(identity).check_ready()
+
+    def build_sdk_server(self, identity: GatewayIdentity) -> Server[Any]:
+        return build_mcp_sdk_server(
+            name="private-dav-gateway-contacts",
+            version=__version__,
+            tools=[
+                CONTACTS_LIST_TOOL,
+                CONTACTS_GET_TOOL,
+                CONTACTS_CREATE_TOOL,
+                CONTACTS_UPDATE_TOOL,
+                CONTACTS_DELETE_TOOL,
+                CONTACTS_PROTECT_TEXT_TOOL,
+            ],
+            handler=lambda payload: self.handle(identity, payload),
+        )
 
     def handle(self, identity: GatewayIdentity, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")

@@ -32,6 +32,7 @@ from private_dav_mcp.gateway_store import (
     GatewayAccount,
     PasswordCredential,
 )
+from private_dav_mcp.mcp_sdk import run_mcp_sdk_request
 
 ACCOUNTS_READ_SCOPE = "dav:accounts:read"
 ACCOUNTS_WRITE_SCOPE = "dav:accounts:write"
@@ -484,7 +485,7 @@ def create_gateway_app(
                     else "dav:calendar:read"
                 )
                 require_scope(identity, required_scope)
-        result = await run_in_threadpool(calendar_mcp.handle, identity, payload)
+        result = await run_mcp_sdk_request(calendar_mcp.build_sdk_server(identity), payload)
         if result is None:
             return Response(status_code=202)
         return JSONResponse(status_code=200, content=result)
@@ -524,7 +525,7 @@ def create_gateway_app(
                     else "dav:contacts:read"
                 )
                 require_scope(identity, required_scope)
-        result = await run_in_threadpool(contacts_mcp.handle, identity, payload)
+        result = await run_mcp_sdk_request(contacts_mcp.build_sdk_server(identity), payload)
         if result is None:
             return Response(status_code=202)
         return JSONResponse(status_code=200, content=result)

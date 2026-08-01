@@ -46,6 +46,8 @@ from private_dav_mcp.gateway_mcp import (
 from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
+from private_dav_mcp.mcp_sdk import SDK_MCP_PROTOCOL_VERSION
+from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 
 ISSUER = "https://minigent.example"
 AUDIENCE = "private-dav"
@@ -280,6 +282,60 @@ def _mcp(
     response = client.post("/mcp", headers=headers, json=payload)
     assert response.status_code == 200, response.text
     return response.json()
+
+
+def test_gateway_mcp_supports_sdk_v2_discovery_and_private_metadata(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, _db_path = gateway
+    headers = _headers(private_pem)
+    metadata = {
+        "io.modelcontextprotocol/protocolVersion": SDK_MCP_PROTOCOL_VERSION,
+        "io.modelcontextprotocol/clientInfo": {"name": "gateway-sdk-test", "version": "1"},
+        "io.modelcontextprotocol/clientCapabilities": {},
+    }
+
+    for path, expected_name in (
+        ("/mcp", "private-dav-gateway"),
+        ("/contacts/mcp", "private-dav-gateway-contacts"),
+    ):
+        discover = client.post(
+            path,
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": {"_meta": metadata},
+            },
+        )
+        assert discover.status_code == 200
+        assert discover.json()["result"]["supportedVersions"] == [SDK_MCP_PROTOCOL_VERSION]
+        assert (
+            discover.json()["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"]
+            == expected_name
+        )
+
+    contacts = client.post(
+        "/contacts/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "contacts_list",
+                "arguments": {},
+                "_meta": metadata,
+            },
+        },
+    ).json()["result"]
+    assert contacts["resultType"] == "complete"
+    assert contacts["_meta"][PRIVATE_VALUES_META_KEY]
+    assert (
+        contacts["_meta"]["io.modelcontextprotocol/serverInfo"]["name"]
+        == "private-dav-gateway-contacts"
+    )
 
 
 def test_gateway_mcp_routes_accounts_calendars_and_free_busy_by_owner(

@@ -17,8 +17,10 @@ details and DAV wire behavior are outside this contract.
 - Tool validation and execution failures are JSON-RPC errors. Opaque or expired object references
   use error code `-32001`; invalid arguments use `-32602`.
 
-The v1 contract uses MCP protocol version `2025-11-25`. A server may negotiate another protocol
-version in a future contract revision.
+The server boundary uses the MCP Python SDK v2. Modern clients negotiate protocol version
+`2026-07-28` through `server/discover` and per-request protocol metadata. For compatibility with
+existing Minigent deployments, `initialize` requests for `2025-11-25` and requests without modern
+protocol metadata retain the v1 response shape. Both modes preserve the private-value envelope.
 
 ## Private-value envelope
 

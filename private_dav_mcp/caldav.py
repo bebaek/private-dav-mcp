@@ -22,6 +22,7 @@ from icalendar import Calendar as ICalendar
 
 from private_dav_mcp import __version__
 from private_dav_mcp.mcp_http import create_mcp_app
+from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 from private_dav_mcp.webdav import (
     DAV_READINESS_TIMEOUT_SECONDS,
@@ -1720,7 +1721,20 @@ def create_app(server: PrivateCalendarMCPServer | None = None) -> FastAPI:
     private_calendar = server or PrivateCalendarMCPServer()
     return create_mcp_app(
         title="Minigent private calendar MCP",
-        handler=private_calendar.handle,
+        sdk_server=build_mcp_sdk_server(
+            name="minigent-private-calendar",
+            version=__version__,
+            tools=[
+                CALENDARS_LIST_TOOL,
+                EVENTS_LIST_TOOL,
+                EVENTS_GET_TOOL,
+                FREE_BUSY_TOOL,
+                EVENTS_CREATE_TOOL,
+                EVENTS_UPDATE_TOOL,
+                EVENTS_DELETE_TOOL,
+            ],
+            handler=private_calendar.handle,
+        ),
         readiness_check=private_calendar.check_ready,
     )
 

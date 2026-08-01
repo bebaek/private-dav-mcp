@@ -18,6 +18,7 @@ from fastapi import FastAPI
 
 from private_dav_mcp import __version__
 from private_dav_mcp.mcp_http import create_mcp_app
+from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 from private_dav_mcp.webdav import (
     DAV_READINESS_TIMEOUT_SECONDS,
@@ -1219,7 +1220,19 @@ def create_app(server: PrivateContactsMCPServer | None = None) -> FastAPI:
     private_contacts = server or PrivateContactsMCPServer()
     return create_mcp_app(
         title="Minigent private contacts MCP",
-        handler=private_contacts.handle,
+        sdk_server=build_mcp_sdk_server(
+            name="minigent-private-contacts",
+            version=__version__,
+            tools=[
+                CONTACTS_LIST_TOOL,
+                CONTACTS_GET_TOOL,
+                CONTACTS_CREATE_TOOL,
+                CONTACTS_UPDATE_TOOL,
+                CONTACTS_DELETE_TOOL,
+                CONTACTS_PROTECT_TEXT_TOOL,
+            ],
+            handler=private_contacts.handle,
+        ),
         readiness_check=private_contacts.check_ready,
     )
 

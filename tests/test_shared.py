@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from private_dav_mcp.mcp_http import CachedReadinessCheck, create_mcp_app
+from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
 from private_dav_mcp.webdav import (
     DAVHTTPClient,
     url_origin,
@@ -133,14 +134,31 @@ def test_cached_readiness_check_without_upstream_is_ready() -> None:
         CachedReadinessCheck(None, ttl_seconds=0)
 
 
-def test_shared_mcp_http_app_handles_results_notifications_and_invalid_payloads() -> None:
-    def handler(payload: dict[str, Any]) -> dict[str, Any] | None:
-        if payload.get("id") is None:
-            return None
-        return {"jsonrpc": "2.0", "id": payload["id"], "result": {"ok": True}}
+def _test_sdk_server():
+    def handler(_payload: dict[str, Any]) -> dict[str, Any] | None:
+        return None
 
+    return build_mcp_sdk_server(
+        name="contract-test",
+        version="1",
+        tools=[
+            {
+                "name": "test_tool",
+                "description": "A test tool.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            }
+        ],
+        handler=handler,
+    )
+
+
+def test_shared_mcp_http_app_handles_results_notifications_and_invalid_payloads() -> None:
     async def run() -> None:
-        app = create_mcp_app(title="Contract test", handler=handler)
+        app = create_mcp_app(title="Contract test", sdk_server=_test_sdk_server())
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://mcp.test"
         ) as client:
@@ -152,9 +170,11 @@ def test_shared_mcp_http_app_handles_results_notifications_and_invalid_payloads(
             assert ready.status_code == 200
             assert ready.json() == {"status": "ready"}
 
-            success = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
+            success = await client.post(
+                "/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+            )
             assert success.status_code == 200
-            assert success.json()["result"] == {"ok": True}
+            assert [tool["name"] for tool in success.json()["result"]["tools"]] == ["test_tool"]
 
             notification = await client.post(
                 "/mcp", json={"jsonrpc": "2.0", "method": "initialized"}
@@ -181,7 +201,9 @@ def test_shared_mcp_http_app_reports_failed_readiness_without_details() -> None:
 
     async def run() -> None:
         app = create_mcp_app(
-            title="Unavailable test", handler=lambda _payload: None, readiness_check=unavailable
+            title="Unavailable test",
+            sdk_server=_test_sdk_server(),
+            readiness_check=unavailable,
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://mcp.test"

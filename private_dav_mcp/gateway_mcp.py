@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
+from mcp.server.lowlevel import Server
+
 from private_dav_mcp import __version__
 from private_dav_mcp.caldav import (
     CALENDARS_LIST_TOOL,
@@ -31,6 +33,7 @@ from private_dav_mcp.gateway_identity import GatewayIdentity
 from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountStore, GatewayAccount, PasswordCredential
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
+from private_dav_mcp.mcp_sdk import build_mcp_sdk_server
 from private_dav_mcp.protocol import DEFAULT_MCP_PROTOCOL_VERSION, PRIVATE_VALUES_META_KEY
 
 CALENDAR_ACCOUNTS_LIST_TOOL = {
@@ -237,6 +240,14 @@ class GatewayCalendarMCP:
             if account is None:  # pragma: no cover - identity is derived from the template
                 raise RuntimeError("Static account owner configuration is invalid")
             self._server_for(account).server.check_ready()
+
+    def build_sdk_server(self, identity: GatewayIdentity) -> Server[Any]:
+        return build_mcp_sdk_server(
+            name="private-dav-gateway",
+            version=__version__,
+            tools=GATEWAY_CALENDAR_TOOLS,
+            handler=lambda payload: self.handle(identity, payload),
+        )
 
     def handle(self, identity: GatewayIdentity, payload: dict[str, Any]) -> dict[str, Any] | None:
         request_id = payload.get("id")

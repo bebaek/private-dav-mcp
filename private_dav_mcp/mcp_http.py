@@ -9,8 +9,10 @@ from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from mcp.server.lowlevel import Server
 
-MCPHandler = Callable[[dict[str, Any]], dict[str, Any] | None]
+from private_dav_mcp.mcp_sdk import run_mcp_sdk_request
+
 ReadinessCheck = Callable[[], None]
 DEFAULT_READINESS_CACHE_TTL_SECONDS = 30.0
 
@@ -54,7 +56,7 @@ class CachedReadinessCheck:
 def create_mcp_app(
     *,
     title: str,
-    handler: MCPHandler,
+    sdk_server: Server[Any],
     readiness_check: ReadinessCheck | None = None,
     readiness_cache_ttl_seconds: float = DEFAULT_READINESS_CACHE_TTL_SECONDS,
 ) -> FastAPI:
@@ -81,7 +83,7 @@ def create_mcp_app(
             return _invalid_request_response(-32700, "Invalid JSON")
         if not isinstance(payload, dict):
             return _invalid_request_response(-32600, "Payload must be an object")
-        result = await asyncio.to_thread(handler, payload)
+        result = await run_mcp_sdk_request(sdk_server, payload)
         if result is None:
             return Response(status_code=202)
         return result

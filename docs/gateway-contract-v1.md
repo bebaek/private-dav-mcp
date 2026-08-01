@@ -286,9 +286,11 @@ A disabled calendar is excluded from implicit multi-calendar free/busy and rejec
 
 ### Lifecycle
 
-The gateway implements MCP protocol version `2025-11-25`. `initialize` returns server name
-`private-dav-gateway`. `notifications/initialized`, `tools/list`, validation behavior, and the
-private-value envelope retain the behavior defined by `docs/contract-v1.md`.
+The gateway uses the MCP Python SDK v2 boundary and negotiates modern protocol version
+`2026-07-28`. It also retains the `2025-11-25` response contract for legacy Minigent callers.
+`initialize` returns server name `private-dav-gateway`. `notifications/initialized`, `tools/list`,
+validation behavior, and the private-value envelope retain the behavior defined by
+`docs/contract-v1.md`.
 
 Authentication is evaluated on every JSON-RPC HTTP request. MCP reference state MUST NOT be shared
 across authenticated owners.
