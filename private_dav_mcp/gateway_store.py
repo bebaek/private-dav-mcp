@@ -41,6 +41,18 @@ class GatewayAccount:
 
 
 @dataclass(frozen=True)
+class ResourceGrant:
+    resource_id: str
+    tenant_id: str
+    user_id: str
+    permission: str
+    enabled: bool
+    updated_by: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class StoredReference:
     reference: str
     tenant_id: str
@@ -397,6 +409,112 @@ class AccountStore:
             updated_at=row["updated_at"],
         )
 
+    def resource_access(
+        self,
+        resource_id: str,
+        tenant_id: str,
+        user_id: str,
+        *,
+        permission: str,
+    ) -> bool | None:
+        if permission not in {"read", "write"}:
+            raise ValueError("Resource permission must be read or write")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT tenant_id, user_id, permission, enabled
+                FROM dav_resource_grants
+                WHERE resource_id = ?
+                """,
+                (resource_id,),
+            ).fetchall()
+        if not rows:
+            return None
+        for row in rows:
+            if not bool(row["enabled"]):
+                continue
+            if str(row["tenant_id"]) != tenant_id or str(row["user_id"]) not in {"*", user_id}:
+                continue
+            granted = str(row["permission"])
+            if permission == "read" or granted == "read_write":
+                return True
+        return False
+
+    def list_resource_grants(self, tenant_id: str) -> list[ResourceGrant]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM dav_resource_grants
+                WHERE tenant_id = ?
+                ORDER BY resource_id, user_id
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return [_resource_grant_from_row(row) for row in rows]
+
+    def upsert_resource_grant(
+        self,
+        *,
+        resource_id: str,
+        tenant_id: str,
+        user_id: str,
+        permission: str,
+        enabled: bool,
+        updated_by: str,
+    ) -> ResourceGrant:
+        if not resource_id or not tenant_id or not user_id or not updated_by:
+            raise ValueError("Resource grant identifiers are required")
+        if permission not in {"read", "read_write"}:
+            raise ValueError("Resource grant permission must be read or read_write")
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO dav_resource_grants (
+                  resource_id, tenant_id, user_id, permission, enabled,
+                  updated_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(resource_id, tenant_id, user_id) DO UPDATE SET
+                  permission = excluded.permission,
+                  enabled = excluded.enabled,
+                  updated_by = excluded.updated_by,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    resource_id,
+                    tenant_id,
+                    user_id,
+                    permission,
+                    int(enabled),
+                    updated_by,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM dav_resource_grants
+                WHERE resource_id = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (resource_id, tenant_id, user_id),
+            ).fetchone()
+            connection.commit()
+        if row is None:  # pragma: no cover - defensive
+            raise RuntimeError("Resource grant was not saved")
+        return _resource_grant_from_row(row)
+
+    def delete_resource_grant(self, resource_id: str, tenant_id: str, user_id: str) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                DELETE FROM dav_resource_grants
+                WHERE resource_id = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (resource_id, tenant_id, user_id),
+            )
+            connection.commit()
+        return cursor.rowcount > 0
+
     def request_hash(self, payload: dict[str, Any]) -> str:
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return self._cipher.fingerprint(encoded)
@@ -670,6 +788,20 @@ class AccountStore:
                 CREATE INDEX IF NOT EXISTS dav_references_owner
                   ON dav_references (tenant_id, user_id, account_ref, reference_type);
 
+                CREATE TABLE IF NOT EXISTS dav_resource_grants (
+                  resource_id TEXT NOT NULL,
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  permission TEXT NOT NULL CHECK (permission IN ('read', 'read_write')),
+                  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                  updated_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (resource_id, tenant_id, user_id)
+                );
+                CREATE INDEX IF NOT EXISTS dav_resource_grants_subject
+                  ON dav_resource_grants (tenant_id, user_id, resource_id);
+
                 CREATE TABLE IF NOT EXISTS gateway_audit (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   tenant_id TEXT NOT NULL,
@@ -679,7 +811,7 @@ class AccountStore:
                   outcome TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 2;
+                PRAGMA user_version = 3;
                 """
             )
             reference_columns = {
@@ -703,9 +835,22 @@ class AccountStore:
                     );
                     CREATE INDEX dav_references_owner
                       ON dav_references (tenant_id, user_id, account_ref, reference_type);
-                    PRAGMA user_version = 2;
+                    PRAGMA user_version = 3;
                     """
                 )
+
+
+def _resource_grant_from_row(row: sqlite3.Row) -> ResourceGrant:
+    return ResourceGrant(
+        resource_id=str(row["resource_id"]),
+        tenant_id=str(row["tenant_id"]),
+        user_id=str(row["user_id"]),
+        permission=str(row["permission"]),
+        enabled=bool(row["enabled"]),
+        updated_by=str(row["updated_by"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
 
 
 def _account_aad(tenant_id: str, user_id: str, account_ref: str) -> bytes:

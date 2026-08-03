@@ -129,7 +129,7 @@ def _token(
     user_id: str = "user-a",
     scopes: str = (
         "dav:accounts:read dav:accounts:write dav:calendar:read dav:calendar:write "
-        "dav:contacts:read dav:contacts:write"
+        "dav:contacts:read dav:contacts:write dav:grants:read dav:grants:write"
     ),
     audience: str = AUDIENCE,
 ) -> str:
@@ -541,6 +541,196 @@ def test_gateway_enforces_scopes_authentication_and_url_policy(
         "message": "Account URL is not allowed.",
         "fields": {"base_url": "URL is not allowed."},
     }
+
+
+def test_resource_grant_api_is_tenant_scoped(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, _db_path = gateway
+    owner_headers = _headers(private_pem)
+    created = client.put(
+        "/v1/resource-grants",
+        headers=owner_headers,
+        json={
+            "resource_id": "caldav:primary",
+            "user_id": "*",
+            "permission": "read_write",
+            "enabled": True,
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["tenant_id"] == "tenant-a"
+    assert created.json()["updated_by"] == "user-a"
+
+    listed = client.get("/v1/resource-grants", headers=owner_headers)
+    assert listed.status_code == 200
+    assert [(item["resource_id"], item["user_id"]) for item in listed.json()["grants"]] == [
+        ("caldav:primary", "*")
+    ]
+    other_tenant = client.get(
+        "/v1/resource-grants",
+        headers=_headers(private_pem, tenant_id="tenant-b"),
+    )
+    assert other_tenant.status_code == 200
+    assert other_tenant.json()["grants"] == []
+
+    deleted = client.delete(
+        "/v1/resource-grants/caldav:primary",
+        params={"user_id": "*"},
+        headers=owner_headers,
+    )
+    assert deleted.status_code == 204
+
+
+def test_resource_grants_support_tenant_and_user_permissions(tmp_path: Path) -> None:
+    store = AccountStore(
+        tmp_path / "grants.db",
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    assert store.resource_access("caldav:primary", "tenant-a", "user-a", permission="read") is None
+
+    store.upsert_resource_grant(
+        resource_id="caldav:primary",
+        tenant_id="tenant-a",
+        user_id="*",
+        permission="read",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    assert store.resource_access("caldav:primary", "tenant-a", "user-a", permission="read") is True
+    assert (
+        store.resource_access("caldav:primary", "tenant-a", "user-a", permission="write") is False
+    )
+    assert store.resource_access("caldav:primary", "tenant-b", "user-a", permission="read") is False
+
+    store.upsert_resource_grant(
+        resource_id="caldav:primary",
+        tenant_id="tenant-a",
+        user_id="user-a",
+        permission="read_write",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    assert store.resource_access("caldav:primary", "tenant-a", "user-a", permission="write") is True
+    assert [
+        (grant.user_id, grant.permission) for grant in store.list_resource_grants("tenant-a")
+    ] == [
+        ("*", "read"),
+        ("user-a", "read_write"),
+    ]
+
+
+def test_static_caldav_resource_grant_overrides_legacy_owner(tmp_path: Path) -> None:
+    store = AccountStore(
+        tmp_path / "calendar-grants.db",
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    template = StaticCalendarAccount(
+        account_id="primary",
+        label="Personal",
+        base_url="https://dav.example/calendars/",
+        username="calendar-user",
+        password="environment-secret",
+        tenant_id="legacy-tenant",
+        user_id="legacy-user",
+    )
+    broker = GatewayCalendarMCP(
+        store,
+        static_accounts=(template,),
+        require_resource_grants=True,
+        server_factory=lambda _account: PrivateCalendarMCPServer(
+            calendars=[Calendar("Personal", "https://dav.example/personal/")]
+        ),
+    )
+    identity = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-b",
+        token_id="granted-token",
+        scopes=frozenset({"dav:calendar:read"}),
+    )
+    assert (
+        broker.call_tool(identity, "calendar_accounts_list", {})["structuredContent"]["accounts"]
+        == []
+    )
+
+    store.upsert_resource_grant(
+        resource_id=template.resource_id,
+        tenant_id="tenant-a",
+        user_id="*",
+        permission="read",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    accounts = broker.call_tool(identity, "calendar_accounts_list", {})["structuredContent"][
+        "accounts"
+    ]
+    assert len(accounts) == 1
+
+
+def test_static_carddav_resource_grants_enforce_read_write(tmp_path: Path) -> None:
+    store = AccountStore(
+        tmp_path / "contact-grants.db",
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    account = StaticContactAccount(
+        account_id="contacts",
+        addressbook_url="https://dav.example/addressbooks/",
+        username="contacts-user",
+        password="contacts-secret",
+        tenant_id="legacy-tenant",
+        user_id="legacy-user",
+    )
+    broker = GatewayContactsMCP(
+        account,
+        store=store,
+        require_resource_grants=True,
+        server_factory=lambda _account: PrivateContactsMCPServer(
+            contacts=[Contact("Private Person")]
+        ),
+    )
+    identity = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-b",
+        token_id="granted-token",
+        scopes=frozenset({"dav:contacts:read", "dav:contacts:write"}),
+    )
+    store.upsert_resource_grant(
+        resource_id=account.resource_id,
+        tenant_id="tenant-a",
+        user_id="*",
+        permission="read",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    assert broker.call_tool(identity, "contacts_list", {})["structuredContent"]["contacts"]
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        broker.call_tool(identity, "contacts_create", {"name": "New Person"})
+    assert exc_info.value.code == -32001
+
+    store.upsert_resource_grant(
+        resource_id=account.resource_id,
+        tenant_id="tenant-a",
+        user_id="*",
+        permission="read_write",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    created = broker.call_tool(identity, "contacts_create", {"name": "New Person"})
+    assert created["structuredContent"]["status"] == "created"
+
+
+@pytest.mark.parametrize("required", ["true", "1", "yes"])
+def test_gateway_settings_parse_required_resource_grants(
+    monkeypatch: pytest.MonkeyPatch, required: str
+) -> None:
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_JWT_ISSUER", ISSUER)
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_JWT_PUBLIC_KEYS", json.dumps({"key-1": "public"}))
+    monkeypatch.setenv(
+        "PRIVATE_DAV_GATEWAY_ENCRYPTION_KEYS",
+        json.dumps({"1": base64.urlsafe_b64encode(b"k" * 32).decode()}),
+    )
+    monkeypatch.setenv("PRIVATE_DAV_GATEWAY_REQUIRE_RESOURCE_GRANTS", required)
+    assert GatewaySettings.from_env().require_resource_grants is True
 
 
 def test_gateway_settings_load_static_caldav_account_from_environment(

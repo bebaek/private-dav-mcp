@@ -148,8 +148,40 @@ against the same limit. Subscription event fields use the same private-value env
 Create, update, and delete operations are rejected as read-only. Up to 50 subscriptions are
 supported; exact tenant and user values are recommended for multi-user deployments.
 
+### Database-backed resource grants
+
+Static credential configuration and access policy are separate. Every configured static source has
+a stable resource ID:
+
+- `caldav:<account-id>`
+- `carddav:<account-id>`
+- `ics:<subscription-id>`
+
+Grant records live in `dav_resource_grants`. A grant is scoped to the authenticated tenant and to
+either one user ID or `*` for every user in that tenant. `read` permits read tools;
+`read_write` also permits DAV mutations. Manage grants with `dav:grants:read` and
+`dav:grants:write` tokens through `GET/PUT/DELETE /v1/resource-grants`.
+
+When the first database grant exists for a resource, grants become authoritative for that resource
+and legacy `tenant_id`/`user_id` ownership no longer grants access. Set
+`PRIVATE_DAV_GATEWAY_REQUIRE_RESOURCE_GRANTS=true` after seeding every configured resource to fail
+closed when a resource has no grants. Leave it false only during migration or for legacy owner-based
+deployments. Grant-management scopes should be issued only to a trusted administrative path, not to
+normal model-facing MCP calls.
+
+Safe migration order:
+
+1. Deploy the grant-capable gateway with `PRIVATE_DAV_GATEWAY_REQUIRE_RESOURCE_GRANTS=false`.
+2. Create a grant for every configured resource and verify intended users through MCP.
+3. Set `PRIVATE_DAV_GATEWAY_REQUIRE_RESOURCE_GRANTS=true` and restart all gateway replicas.
+4. Remove legacy static `tenant_id` and `user_id` ownership only after the fail-closed rollout is
+   healthy. Keep credentials in the deployment secret until a separate credential-onboarding
+   migration is implemented.
+
 Implemented interfaces:
 
+- `GET/PUT /v1/resource-grants`
+- `DELETE /v1/resource-grants/{resource_id}?user_id=...`
 - `GET/POST /v1/accounts`
 - `GET/PATCH/DELETE /v1/accounts/{account_ref}`
 - `POST /v1/accounts/{account_ref}/test`
@@ -162,13 +194,14 @@ Implemented interfaces:
 Credential fields submitted through the management API are write-only and account labels, URLs,
 usernames, and passwords are encrypted at rest with a per-account DEK wrapped by the active
 deployment KEK. Environment-configured accounts remain in the environment and bypass database
-onboarding. Every account and MCP request is scoped to the tenant and user from the verified bearer
-token. Contact, calendar, and event references are encrypted at rest in SQLite; only a SHA-256 hash
-of the opaque token is indexed. References are bound to tenant, user, account, account revision, and
-resource type, expire after their normal TTL, resolve across gateway instances, and are invalidated
-by account or environment configuration updates. This permits replicas that share the same gateway
-SQLite database; deployments must still ensure the underlying volume and all other application
-stores support their chosen replica topology.
+onboarding. Resource grants contain no DAV credentials and dynamically authorize static sources by
+tenant and user. Every account and MCP request is scoped to the tenant and user from the verified
+bearer token. Contact, calendar, and event references are encrypted at rest in SQLite; only a
+SHA-256 hash of the opaque token is indexed. References are bound to tenant, user, account, account
+revision, and resource type, expire after their normal TTL, resolve across gateway instances, and
+are invalidated by account or environment configuration updates. This permits replicas that share
+the same gateway SQLite database; deployments must still ensure the underlying volume and all other
+application stores support their chosen replica topology.
 
 ## CardDAV
 

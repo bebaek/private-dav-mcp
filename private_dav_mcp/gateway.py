@@ -36,6 +36,8 @@ from private_dav_mcp.mcp_sdk import run_mcp_sdk_request
 
 ACCOUNTS_READ_SCOPE = "dav:accounts:read"
 ACCOUNTS_WRITE_SCOPE = "dav:accounts:write"
+GRANTS_READ_SCOPE = "dav:grants:read"
+GRANTS_WRITE_SCOPE = "dav:grants:write"
 
 
 class GatewayAPIError(RuntimeError):
@@ -137,6 +139,15 @@ class PasswordAuthInput(BaseModel):
     username: str = Field(min_length=1, max_length=320)
     password: SecretStr = Field(min_length=1, max_length=4096)
     mode: str = Field(pattern="^(auto|basic|digest)$")
+
+
+class ResourceGrantPutInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resource_id: str = Field(min_length=1, max_length=200, pattern=r"^[a-z0-9][a-z0-9:._-]+$")
+    user_id: str = Field(min_length=1, max_length=200)
+    permission: str = Field(pattern="^(read|read_write)$")
+    enabled: bool = True
 
 
 class AccountCreateInput(BaseModel):
@@ -310,6 +321,7 @@ class GatewaySettings:
     allowed_host_suffixes: tuple[str, ...]
     static_accounts: tuple[StaticGatewayAccount, ...]
     static_contact_account: StaticContactAccount | None
+    require_resource_grants: bool
 
     @classmethod
     def from_env(cls) -> GatewaySettings:
@@ -351,6 +363,9 @@ class GatewaySettings:
                 *_static_ics_subscriptions_from_env(os.environ),
             ),
             static_contact_account=_static_contact_account_from_env(os.environ),
+            require_resource_grants=_bool_env(
+                os.environ, "PRIVATE_DAV_GATEWAY_REQUIRE_RESOURCE_GRANTS", False
+            ),
         )
 
 
@@ -386,6 +401,15 @@ def create_gateway_app(
     url_policy = url_policy or OutboundURLPolicy()
     static_accounts = settings.static_accounts if settings is not None else ()
     static_contact_account = settings.static_contact_account if settings is not None else None
+    require_resource_grants = settings.require_resource_grants if settings is not None else False
+    configured_resource_ids = (
+        {
+            *(account.resource_id for account in static_accounts),
+            *((static_contact_account.resource_id,) if static_contact_account is not None else ()),
+        }
+        if settings is not None
+        else None
+    )
     for static_account in static_accounts:
         url_policy.validate(static_account.base_url)
     if static_contact_account is not None:
@@ -393,8 +417,13 @@ def create_gateway_app(
     calendar_mcp = calendar_mcp or GatewayCalendarMCP(
         store,
         static_accounts=static_accounts,
+        require_resource_grants=require_resource_grants,
     )
-    contacts_mcp = contacts_mcp or GatewayContactsMCP(static_contact_account, store=store)
+    contacts_mcp = contacts_mcp or GatewayContactsMCP(
+        static_contact_account,
+        store=store,
+        require_resource_grants=require_resource_grants,
+    )
     app = FastAPI(title="Private DAV Gateway", version="1")
 
     @app.exception_handler(GatewayAPIError)
@@ -529,6 +558,53 @@ def create_gateway_app(
         if result is None:
             return Response(status_code=202)
         return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/resource-grants")
+    async def list_resource_grants(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_READ_SCOPE)
+        grants = await run_in_threadpool(store.list_resource_grants, identity.tenant_id)
+        return {"grants": [_resource_grant_response(grant) for grant in grants]}
+
+    @app.put("/v1/resource-grants")
+    async def put_resource_grant(
+        payload: ResourceGrantPutInput,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_WRITE_SCOPE)
+        if (
+            configured_resource_ids is not None
+            and payload.resource_id not in configured_resource_ids
+        ):
+            raise GatewayAPIError(404, "not_found", "DAV resource was not found.")
+        grant = await run_in_threadpool(
+            store.upsert_resource_grant,
+            resource_id=payload.resource_id,
+            tenant_id=identity.tenant_id,
+            user_id=payload.user_id,
+            permission=payload.permission,
+            enabled=payload.enabled,
+            updated_by=identity.user_id,
+        )
+        return _resource_grant_response(grant)
+
+    @app.delete("/v1/resource-grants/{resource_id}", status_code=204)
+    async def delete_resource_grant(
+        resource_id: str,
+        user_id: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> Response:
+        require_scope(identity, GRANTS_WRITE_SCOPE)
+        deleted = await run_in_threadpool(
+            store.delete_resource_grant,
+            resource_id,
+            identity.tenant_id,
+            user_id,
+        )
+        if not deleted:
+            raise GatewayAPIError(404, "not_found", "Resource grant was not found.")
+        return Response(status_code=204)
 
     @app.get("/v1/accounts")
     async def list_accounts(
@@ -768,6 +844,31 @@ def _username_hint(username: str) -> str:
         local, domain = username.rsplit("@", 1)
         return f"{local[:1]}…@{domain}"
     return f"{username[:1]}…{username[-1:]}"
+
+
+def _resource_grant_response(grant: Any) -> dict[str, Any]:
+    return {
+        "resource_id": grant.resource_id,
+        "tenant_id": grant.tenant_id,
+        "user_id": grant.user_id,
+        "permission": grant.permission,
+        "enabled": grant.enabled,
+        "updated_by": grant.updated_by,
+        "created_at": grant.created_at,
+        "updated_at": grant.updated_at,
+    }
+
+
+def _bool_env(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean")
 
 
 def _resolve_host(host: str) -> list[str]:
