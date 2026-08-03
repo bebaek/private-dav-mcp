@@ -157,10 +157,12 @@ a stable resource ID:
 - `carddav:<account-id>`
 - `ics:<subscription-id>`
 
-Grant records live in `dav_resource_grants`. A grant is scoped to the authenticated tenant and to
-either one user ID or `*` for every user in that tenant. `read` permits read tools;
-`read_write` also permits DAV mutations. Manage grants with `dav:grants:read` and
-`dav:grants:write` tokens through `GET/PUT/DELETE /v1/resource-grants`.
+Grant records live in `dav_resource_grants`. Every grant mutation also appends an immutable record
+to `dav_resource_grant_audit`, including the actor and previous/resulting policy state. A grant is
+scoped to the authenticated tenant and to either one user ID or `*` for every user in that tenant.
+`read` permits read tools; `read_write` also permits DAV mutations. Manage grants with
+`dav:grants:read` and `dav:grants:write` tokens through `GET/PUT/DELETE /v1/resource-grants`; read
+the tenant-scoped audit history through `GET /v1/resource-grant-audit`.
 
 When the first database grant exists for a resource, grants become authoritative for that resource
 and legacy `tenant_id`/`user_id` ownership no longer grants access. Set
@@ -182,6 +184,7 @@ Implemented interfaces:
 
 - `GET/PUT /v1/resource-grants`
 - `DELETE /v1/resource-grants/{resource_id}?user_id=...`
+- `GET /v1/resource-grant-audit?limit=...&before_id=...`
 - `GET/POST /v1/accounts`
 - `GET/PATCH/DELETE /v1/accounts/{account_ref}`
 - `POST /v1/accounts/{account_ref}/test`

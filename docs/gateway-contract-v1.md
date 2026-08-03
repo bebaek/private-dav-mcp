@@ -123,7 +123,17 @@ Scope: dav:grants:write
 
 DELETE /v1/resource-grants/{resource_id}?user_id={user_id}
 Scope: dav:grants:write
+
+GET /v1/resource-grant-audit?limit={1..500}&before_id={audit_id}
+Scope: dav:grants:read
 ```
+
+Grant create, permission change, enable, disable, no-op upsert, combined update, and delete requests
+MUST append an audit record in the same transaction as the grant mutation. Audit records include the
+resource, tenant, subject, actor, operation, previous state, resulting state, and timestamp. They
+MUST NOT contain DAV credentials or upstream URLs and MUST reject updates and deletions. The audit
+endpoint returns newest entries first, is tenant-scoped from the verified token, and returns a
+`next_cursor` suitable for the next `before_id` query.
 
 The tenant always comes from the verified token and MUST NOT be accepted in a request body. Once a
 resource has any grant rows, those rows replace legacy static owner matching for that resource.

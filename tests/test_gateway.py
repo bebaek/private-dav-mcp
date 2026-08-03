@@ -581,6 +581,31 @@ def test_resource_grant_api_is_tenant_scoped(
     )
     assert deleted.status_code == 204
 
+    audit = client.get("/v1/resource-grant-audit", headers=owner_headers)
+    assert audit.status_code == 200
+    assert audit.json()["next_cursor"] is None
+    assert [entry["operation"] for entry in audit.json()["entries"]] == [
+        "resource_grant.delete",
+        "resource_grant.create",
+    ]
+    assert audit.json()["entries"][0] == {
+        "audit_id": 2,
+        "resource_id": "caldav:primary",
+        "tenant_id": "tenant-a",
+        "user_id": "*",
+        "actor_id": "user-a",
+        "operation": "resource_grant.delete",
+        "previous": {"permission": "read_write", "enabled": True},
+        "resulting": None,
+        "created_at": audit.json()["entries"][0]["created_at"],
+    }
+    other_audit = client.get(
+        "/v1/resource-grant-audit",
+        headers=_headers(private_pem, tenant_id="tenant-b"),
+    )
+    assert other_audit.status_code == 200
+    assert other_audit.json() == {"entries": [], "next_cursor": None}
+
 
 def test_resource_grants_support_tenant_and_user_permissions(tmp_path: Path) -> None:
     store = AccountStore(
@@ -618,6 +643,46 @@ def test_resource_grants_support_tenant_and_user_permissions(tmp_path: Path) -> 
         ("*", "read"),
         ("user-a", "read_write"),
     ]
+
+
+def test_resource_grant_audit_is_transactional_and_append_only(tmp_path: Path) -> None:
+    db_path = tmp_path / "grant-audit.db"
+    store = AccountStore(
+        db_path,
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    values = {
+        "resource_id": "carddav:contacts",
+        "tenant_id": "tenant-a",
+        "user_id": "user-a",
+        "updated_by": "admin-a",
+    }
+    store.upsert_resource_grant(permission="read", enabled=True, **values)
+    store.upsert_resource_grant(permission="read_write", enabled=True, **values)
+    store.upsert_resource_grant(permission="read_write", enabled=False, **values)
+    store.upsert_resource_grant(permission="read_write", enabled=True, **values)
+    assert store.delete_resource_grant(
+        "carddav:contacts", "tenant-a", "user-a", deleted_by="admin-b"
+    )
+
+    entries = list(reversed(store.list_resource_grant_audit("tenant-a", limit=10)))
+    assert [entry.operation for entry in entries] == [
+        "resource_grant.create",
+        "resource_grant.permission_change",
+        "resource_grant.disable",
+        "resource_grant.enable",
+        "resource_grant.delete",
+    ]
+    assert entries[0].previous_permission is None
+    assert entries[0].resulting_permission == "read"
+    assert entries[-1].actor_id == "admin-b"
+    assert entries[-1].previous_enabled is True
+    assert entries[-1].resulting_permission is None
+
+    with sqlite3.connect(db_path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute("DELETE FROM dav_resource_grant_audit")
+    assert len(store.list_resource_grant_audit("tenant-a", limit=10)) == 5
 
 
 def test_static_caldav_resource_grant_overrides_legacy_owner(tmp_path: Path) -> None:

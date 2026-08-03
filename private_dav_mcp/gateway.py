@@ -567,6 +567,30 @@ def create_gateway_app(
         grants = await run_in_threadpool(store.list_resource_grants, identity.tenant_id)
         return {"grants": [_resource_grant_response(grant) for grant in grants]}
 
+    @app.get("/v1/resource-grant-audit")
+    async def list_resource_grant_audit(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+        limit: int = 100,
+        before_id: int | None = None,
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_READ_SCOPE)
+        if limit < 1 or limit > 500:
+            raise GatewayAPIError(422, "invalid_request", "Limit must be between 1 and 500.")
+        if before_id is not None and before_id < 1:
+            raise GatewayAPIError(422, "invalid_request", "Audit cursor must be positive.")
+        entries = await run_in_threadpool(
+            store.list_resource_grant_audit,
+            identity.tenant_id,
+            limit=limit + 1,
+            before_id=before_id,
+        )
+        has_more = len(entries) > limit
+        entries = entries[:limit]
+        return {
+            "entries": [_resource_grant_audit_response(entry) for entry in entries],
+            "next_cursor": entries[-1].audit_id if has_more else None,
+        }
+
     @app.put("/v1/resource-grants")
     async def put_resource_grant(
         payload: ResourceGrantPutInput,
@@ -601,6 +625,7 @@ def create_gateway_app(
             resource_id,
             identity.tenant_id,
             user_id,
+            deleted_by=identity.user_id,
         )
         if not deleted:
             raise GatewayAPIError(404, "not_found", "Resource grant was not found.")
@@ -856,6 +881,28 @@ def _resource_grant_response(grant: Any) -> dict[str, Any]:
         "updated_by": grant.updated_by,
         "created_at": grant.created_at,
         "updated_at": grant.updated_at,
+    }
+
+
+def _resource_grant_audit_response(entry: Any) -> dict[str, Any]:
+    return {
+        "audit_id": entry.audit_id,
+        "resource_id": entry.resource_id,
+        "tenant_id": entry.tenant_id,
+        "user_id": entry.user_id,
+        "actor_id": entry.actor_id,
+        "operation": entry.operation,
+        "previous": (
+            {"permission": entry.previous_permission, "enabled": entry.previous_enabled}
+            if entry.previous_permission is not None
+            else None
+        ),
+        "resulting": (
+            {"permission": entry.resulting_permission, "enabled": entry.resulting_enabled}
+            if entry.resulting_permission is not None
+            else None
+        ),
+        "created_at": entry.created_at,
     }
 
 

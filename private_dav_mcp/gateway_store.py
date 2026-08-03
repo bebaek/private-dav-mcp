@@ -53,6 +53,21 @@ class ResourceGrant:
 
 
 @dataclass(frozen=True)
+class ResourceGrantAudit:
+    audit_id: int
+    resource_id: str
+    tenant_id: str
+    user_id: str
+    actor_id: str
+    operation: str
+    previous_permission: str | None
+    previous_enabled: bool | None
+    resulting_permission: str | None
+    resulting_enabled: bool | None
+    created_at: str
+
+
+@dataclass(frozen=True)
 class StoredReference:
     reference: str
     tenant_id: str
@@ -452,6 +467,31 @@ class AccountStore:
             ).fetchall()
         return [_resource_grant_from_row(row) for row in rows]
 
+    def list_resource_grant_audit(
+        self,
+        tenant_id: str,
+        *,
+        limit: int,
+        before_id: int | None = None,
+    ) -> list[ResourceGrantAudit]:
+        if limit < 1:
+            raise ValueError("Resource grant audit limit must be positive")
+        if before_id is not None and before_id < 1:
+            raise ValueError("Resource grant audit cursor must be positive")
+        query = """
+            SELECT * FROM dav_resource_grant_audit
+            WHERE tenant_id = ?
+        """
+        parameters: list[str | int] = [tenant_id]
+        if before_id is not None:
+            query += " AND id < ?"
+            parameters.append(before_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_resource_grant_audit_from_row(row) for row in rows]
+
     def upsert_resource_grant(
         self,
         *,
@@ -468,6 +508,14 @@ class AccountStore:
             raise ValueError("Resource grant permission must be read or read_write")
         now = _utc_now()
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                """
+                SELECT * FROM dav_resource_grants
+                WHERE resource_id = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (resource_id, tenant_id, user_id),
+            ).fetchone()
             connection.execute(
                 """
                 INSERT INTO dav_resource_grants (
@@ -498,19 +546,61 @@ class AccountStore:
                 """,
                 (resource_id, tenant_id, user_id),
             ).fetchone()
+            if row is None:  # pragma: no cover - defensive
+                raise RuntimeError("Resource grant was not saved")
+            self._audit_resource_grant(
+                connection,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                actor_id=updated_by,
+                operation=_resource_grant_operation(previous, row),
+                previous=previous,
+                resulting=row,
+                created_at=now,
+            )
             connection.commit()
-        if row is None:  # pragma: no cover - defensive
-            raise RuntimeError("Resource grant was not saved")
         return _resource_grant_from_row(row)
 
-    def delete_resource_grant(self, resource_id: str, tenant_id: str, user_id: str) -> bool:
+    def delete_resource_grant(
+        self,
+        resource_id: str,
+        tenant_id: str,
+        user_id: str,
+        *,
+        deleted_by: str,
+    ) -> bool:
+        if not deleted_by:
+            raise ValueError("Resource grant actor is required")
         with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            previous = connection.execute(
+                """
+                SELECT * FROM dav_resource_grants
+                WHERE resource_id = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (resource_id, tenant_id, user_id),
+            ).fetchone()
+            if previous is None:
+                connection.rollback()
+                return False
             cursor = connection.execute(
                 """
                 DELETE FROM dav_resource_grants
                 WHERE resource_id = ? AND tenant_id = ? AND user_id = ?
                 """,
                 (resource_id, tenant_id, user_id),
+            )
+            self._audit_resource_grant(
+                connection,
+                resource_id=resource_id,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                actor_id=deleted_by,
+                operation="resource_grant.delete",
+                previous=previous,
+                resulting=None,
+                created_at=_utc_now(),
             )
             connection.commit()
         return cursor.rowcount > 0
@@ -708,6 +798,41 @@ class AccountStore:
         )
 
     @staticmethod
+    def _audit_resource_grant(
+        connection: sqlite3.Connection,
+        *,
+        resource_id: str,
+        tenant_id: str,
+        user_id: str,
+        actor_id: str,
+        operation: str,
+        previous: sqlite3.Row | None,
+        resulting: sqlite3.Row | None,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO dav_resource_grant_audit (
+              resource_id, tenant_id, user_id, actor_id, operation,
+              previous_permission, previous_enabled,
+              resulting_permission, resulting_enabled, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                resource_id,
+                tenant_id,
+                user_id,
+                actor_id,
+                operation,
+                str(previous["permission"]) if previous is not None else None,
+                int(previous["enabled"]) if previous is not None else None,
+                str(resulting["permission"]) if resulting is not None else None,
+                int(resulting["enabled"]) if resulting is not None else None,
+                created_at,
+            ),
+        )
+
+    @staticmethod
     def _audit(
         connection: sqlite3.Connection,
         account: GatewayAccount,
@@ -802,6 +927,40 @@ class AccountStore:
                 CREATE INDEX IF NOT EXISTS dav_resource_grants_subject
                   ON dav_resource_grants (tenant_id, user_id, resource_id);
 
+                CREATE TABLE IF NOT EXISTS dav_resource_grant_audit (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  resource_id TEXT NOT NULL,
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  actor_id TEXT NOT NULL,
+                  operation TEXT NOT NULL,
+                  previous_permission TEXT CHECK (
+                    previous_permission IS NULL OR previous_permission IN ('read', 'read_write')
+                  ),
+                  previous_enabled INTEGER CHECK (
+                    previous_enabled IS NULL OR previous_enabled IN (0, 1)
+                  ),
+                  resulting_permission TEXT CHECK (
+                    resulting_permission IS NULL OR resulting_permission IN ('read', 'read_write')
+                  ),
+                  resulting_enabled INTEGER CHECK (
+                    resulting_enabled IS NULL OR resulting_enabled IN (0, 1)
+                  ),
+                  created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS dav_resource_grant_audit_tenant
+                  ON dav_resource_grant_audit (tenant_id, id DESC);
+                CREATE TRIGGER IF NOT EXISTS dav_resource_grant_audit_no_update
+                  BEFORE UPDATE ON dav_resource_grant_audit
+                  BEGIN
+                    SELECT RAISE(ABORT, 'resource grant audit is append-only');
+                  END;
+                CREATE TRIGGER IF NOT EXISTS dav_resource_grant_audit_no_delete
+                  BEFORE DELETE ON dav_resource_grant_audit
+                  BEGIN
+                    SELECT RAISE(ABORT, 'resource grant audit is append-only');
+                  END;
+
                 CREATE TABLE IF NOT EXISTS gateway_audit (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   tenant_id TEXT NOT NULL,
@@ -811,7 +970,7 @@ class AccountStore:
                   outcome TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 3;
+                PRAGMA user_version = 4;
                 """
             )
             reference_columns = {
@@ -835,7 +994,7 @@ class AccountStore:
                     );
                     CREATE INDEX dav_references_owner
                       ON dav_references (tenant_id, user_id, account_ref, reference_type);
-                    PRAGMA user_version = 3;
+                    PRAGMA user_version = 4;
                     """
                 )
 
@@ -851,6 +1010,44 @@ def _resource_grant_from_row(row: sqlite3.Row) -> ResourceGrant:
         created_at=str(row["created_at"]),
         updated_at=str(row["updated_at"]),
     )
+
+
+def _resource_grant_audit_from_row(row: sqlite3.Row) -> ResourceGrantAudit:
+    return ResourceGrantAudit(
+        audit_id=int(row["id"]),
+        resource_id=str(row["resource_id"]),
+        tenant_id=str(row["tenant_id"]),
+        user_id=str(row["user_id"]),
+        actor_id=str(row["actor_id"]),
+        operation=str(row["operation"]),
+        previous_permission=(
+            str(row["previous_permission"]) if row["previous_permission"] is not None else None
+        ),
+        previous_enabled=(
+            bool(row["previous_enabled"]) if row["previous_enabled"] is not None else None
+        ),
+        resulting_permission=(
+            str(row["resulting_permission"]) if row["resulting_permission"] is not None else None
+        ),
+        resulting_enabled=(
+            bool(row["resulting_enabled"]) if row["resulting_enabled"] is not None else None
+        ),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _resource_grant_operation(previous: sqlite3.Row | None, resulting: sqlite3.Row) -> str:
+    if previous is None:
+        return "resource_grant.create"
+    permission_changed = previous["permission"] != resulting["permission"]
+    enabled_changed = bool(previous["enabled"]) != bool(resulting["enabled"])
+    if permission_changed and enabled_changed:
+        return "resource_grant.update"
+    if permission_changed:
+        return "resource_grant.permission_change"
+    if enabled_changed:
+        return "resource_grant.enable" if bool(resulting["enabled"]) else "resource_grant.disable"
+    return "resource_grant.touch"
 
 
 def _account_aad(tenant_id: str, user_id: str, account_ref: str) -> bytes:
