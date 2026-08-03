@@ -25,6 +25,7 @@ from private_dav_mcp.caldav import CachedReference, Calendar, Event, PrivateCale
 from private_dav_mcp.carddav import CachedContact, Contact, PrivateContactsMCPServer
 from private_dav_mcp.gateway import (
     AccountConnectionError,
+    DAVResource,
     GatewaySettings,
     OutboundURLPolicy,
     create_gateway_app,
@@ -118,6 +119,26 @@ def gateway(
         url_policy=policy,
         calendar_mcp=calendar_mcp,
         contacts_mcp=contacts_mcp,
+        resource_catalog=(
+            DAVResource(
+                resource_id="caldav:primary",
+                kind="caldav",
+                label="Personal calendar",
+                allowed_permissions=("read", "read_write"),
+            ),
+            DAVResource(
+                resource_id="carddav:contacts",
+                kind="carddav",
+                label="Contacts",
+                allowed_permissions=("read", "read_write"),
+            ),
+            DAVResource(
+                resource_id="ics:holidays",
+                kind="ics",
+                label="Holidays",
+                allowed_permissions=("read",),
+            ),
+        ),
     )
     return TestClient(app), private_pem, connector, db_path
 
@@ -541,6 +562,67 @@ def test_gateway_enforces_scopes_authentication_and_url_policy(
         "message": "Account URL is not allowed.",
         "fields": {"base_url": "URL is not allowed."},
     }
+
+
+def test_resource_catalog_is_safe_scoped_and_enforces_permissions(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, _db_path = gateway
+    unauthenticated = client.get("/v1/resources")
+    assert unauthenticated.status_code == 401
+    denied = client.get(
+        "/v1/resources",
+        headers=_headers(private_pem, scopes="dav:calendar:read"),
+    )
+    assert denied.status_code == 403
+
+    response = client.get("/v1/resources", headers=_headers(private_pem))
+    assert response.status_code == 200
+    assert response.json() == {
+        "resources": [
+            {
+                "resource_id": "caldav:primary",
+                "kind": "caldav",
+                "label": "Personal calendar",
+                "allowed_permissions": ["read", "read_write"],
+                "configured": True,
+                "enabled": True,
+            },
+            {
+                "resource_id": "carddav:contacts",
+                "kind": "carddav",
+                "label": "Contacts",
+                "allowed_permissions": ["read", "read_write"],
+                "configured": True,
+                "enabled": True,
+            },
+            {
+                "resource_id": "ics:holidays",
+                "kind": "ics",
+                "label": "Holidays",
+                "allowed_permissions": ["read"],
+                "configured": True,
+                "enabled": True,
+            },
+        ]
+    }
+    encoded = json.dumps(response.json())
+    assert "https://" not in encoded
+    assert "password" not in encoded
+    assert "username" not in encoded
+
+    unsupported = client.put(
+        "/v1/resource-grants",
+        headers=_headers(private_pem),
+        json={
+            "resource_id": "ics:holidays",
+            "user_id": "user-a",
+            "permission": "read_write",
+            "enabled": True,
+        },
+    )
+    assert unsupported.status_code == 422
+    assert unsupported.json()["error"]["code"] == "unsupported_permission"
 
 
 def test_resource_grant_api_is_tenant_scoped(

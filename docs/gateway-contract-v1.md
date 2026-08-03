@@ -115,6 +115,9 @@ themselves; access is allowed when any enabled matching grant permits the reques
 `read_write` includes read access. Grant records never contain credentials or upstream URLs.
 
 ```http
+GET /v1/resources
+Scope: dav:grants:read
+
 GET /v1/resource-grants
 Scope: dav:grants:read
 
@@ -127,6 +130,13 @@ Scope: dav:grants:write
 GET /v1/resource-grant-audit?limit={1..500}&before_id={audit_id}
 Scope: dav:grants:read
 ```
+
+The resource catalog contains only stable resource IDs, administrative labels, resource kinds,
+configuration/enabled flags, and supported permissions. It MUST NOT return upstream URLs,
+usernames, credentials, or secret-backed configuration. Labels are administrative private data and
+MUST be returned only to a scoped identity. ICS subscriptions advertise only `read`; CalDAV and
+CardDAV resources advertise `read` and `read_write`. Grant upserts MUST reject permissions not
+advertised by a configured resource.
 
 Grant create, permission change, enable, disable, no-op upsert, combined update, and delete requests
 MUST append an audit record in the same transaction as the grant mutation. Audit records include the

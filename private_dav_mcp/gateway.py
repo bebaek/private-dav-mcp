@@ -310,6 +310,16 @@ def _static_contact_account_from_env(env: Mapping[str, str]) -> StaticContactAcc
 
 
 @dataclass(frozen=True)
+class DAVResource:
+    resource_id: str
+    kind: str
+    label: str
+    allowed_permissions: tuple[str, ...]
+    configured: bool = True
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class GatewaySettings:
     db_path: str
     jwt_issuer: str
@@ -378,6 +388,7 @@ def create_gateway_app(
     calendar_mcp: GatewayCalendarMCP | None = None,
     contacts_mcp: GatewayContactsMCP | None = None,
     settings: GatewaySettings | None = None,
+    resource_catalog: tuple[DAVResource, ...] | None = None,
 ) -> FastAPI:
     if verifier is None or store is None:
         settings = settings or GatewaySettings.from_env()
@@ -402,13 +413,11 @@ def create_gateway_app(
     static_accounts = settings.static_accounts if settings is not None else ()
     static_contact_account = settings.static_contact_account if settings is not None else None
     require_resource_grants = settings.require_resource_grants if settings is not None else False
+    if resource_catalog is None:
+        resource_catalog = _configured_resource_catalog(static_accounts, static_contact_account)
+    resource_by_id = {resource.resource_id: resource for resource in resource_catalog}
     configured_resource_ids = (
-        {
-            *(account.resource_id for account in static_accounts),
-            *((static_contact_account.resource_id,) if static_contact_account is not None else ()),
-        }
-        if settings is not None
-        else None
+        set(resource_by_id) if settings is not None or resource_catalog else None
     )
     for static_account in static_accounts:
         url_policy.validate(static_account.base_url)
@@ -559,6 +568,15 @@ def create_gateway_app(
             return Response(status_code=202)
         return JSONResponse(status_code=200, content=result)
 
+    @app.get("/v1/resources")
+    async def list_resources(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_READ_SCOPE)
+        return {
+            "resources": [_resource_response(resource) for resource in resource_catalog],
+        }
+
     @app.get("/v1/resource-grants")
     async def list_resource_grants(
         identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
@@ -602,6 +620,17 @@ def create_gateway_app(
             and payload.resource_id not in configured_resource_ids
         ):
             raise GatewayAPIError(404, "not_found", "DAV resource was not found.")
+        configured_resource = resource_by_id.get(payload.resource_id)
+        if (
+            configured_resource is not None
+            and payload.permission not in configured_resource.allowed_permissions
+        ):
+            raise GatewayAPIError(
+                422,
+                "unsupported_permission",
+                "Permission is not supported by this DAV resource.",
+                fields={"permission": "Permission is not supported by this resource."},
+            )
         grant = await run_in_threadpool(
             store.upsert_resource_grant,
             resource_id=payload.resource_id,
@@ -869,6 +898,44 @@ def _username_hint(username: str) -> str:
         local, domain = username.rsplit("@", 1)
         return f"{local[:1]}…@{domain}"
     return f"{username[:1]}…{username[-1:]}"
+
+
+def _configured_resource_catalog(
+    static_accounts: tuple[StaticGatewayAccount, ...],
+    static_contact_account: StaticContactAccount | None,
+) -> tuple[DAVResource, ...]:
+    resources = [
+        DAVResource(
+            resource_id=account.resource_id,
+            kind="ics" if isinstance(account, StaticICSSubscription) else "caldav",
+            label=account.label,
+            allowed_permissions=(
+                ("read",) if isinstance(account, StaticICSSubscription) else ("read", "read_write")
+            ),
+        )
+        for account in static_accounts
+    ]
+    if static_contact_account is not None:
+        resources.append(
+            DAVResource(
+                resource_id=static_contact_account.resource_id,
+                kind="carddav",
+                label="Contacts",
+                allowed_permissions=("read", "read_write"),
+            )
+        )
+    return tuple(sorted(resources, key=lambda resource: resource.resource_id))
+
+
+def _resource_response(resource: DAVResource) -> dict[str, Any]:
+    return {
+        "resource_id": resource.resource_id,
+        "kind": resource.kind,
+        "label": resource.label,
+        "allowed_permissions": list(resource.allowed_permissions),
+        "configured": resource.configured,
+        "enabled": resource.enabled,
+    }
 
 
 def _resource_grant_response(grant: Any) -> dict[str, Any]:

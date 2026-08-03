@@ -160,9 +160,11 @@ a stable resource ID:
 Grant records live in `dav_resource_grants`. Every grant mutation also appends an immutable record
 to `dav_resource_grant_audit`, including the actor and previous/resulting policy state. A grant is
 scoped to the authenticated tenant and to either one user ID or `*` for every user in that tenant.
-`read` permits read tools; `read_write` also permits DAV mutations. Manage grants with
-`dav:grants:read` and `dav:grants:write` tokens through `GET/PUT/DELETE /v1/resource-grants`; read
-the tenant-scoped audit history through `GET /v1/resource-grant-audit`.
+`read` permits read tools; `read_write` also permits DAV mutations. The scoped `GET /v1/resources`
+catalog returns stable IDs, labels, resource kinds, and supported permissions without returning
+upstream URLs or credentials. Manage grants with `dav:grants:read` and `dav:grants:write` tokens
+through `GET/PUT/DELETE /v1/resource-grants`; read the tenant-scoped audit history through
+`GET /v1/resource-grant-audit`.
 
 When the first database grant exists for a resource, grants become authoritative for that resource
 and legacy `tenant_id`/`user_id` ownership no longer grants access. Set
@@ -182,6 +184,7 @@ Safe migration order:
 
 Implemented interfaces:
 
+- `GET /v1/resources`
 - `GET/PUT /v1/resource-grants`
 - `DELETE /v1/resource-grants/{resource_id}?user_id=...`
 - `GET /v1/resource-grant-audit?limit=...&before_id=...`
