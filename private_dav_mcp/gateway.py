@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ipaddress
 import json
+import logging
 import os
 import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Annotated, Any, Protocol
 from urllib.parse import urlsplit
 
@@ -16,6 +19,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
+from uvicorn.config import LOGGING_CONFIG
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
 from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
@@ -36,6 +40,51 @@ from private_dav_mcp.mcp_sdk import run_mcp_sdk_request
 
 ACCOUNTS_READ_SCOPE = "dav:accounts:read"
 ACCOUNTS_WRITE_SCOPE = "dav:accounts:write"
+GRANTS_READ_SCOPE = "dav:grants:read"
+GRANTS_WRITE_SCOPE = "dav:grants:write"
+
+
+class JSONLogFormatter(logging.Formatter):
+    """Render gateway logs as one JSON object per line for production collectors."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        event: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            event["exception"] = self.formatException(record.exc_info)
+        return json.dumps(event, ensure_ascii=False)
+
+
+class HealthcheckAccessLogFilter(logging.Filter):
+    """Keep routine liveness and readiness probes out of the access log."""
+
+    _HEALTHCHECK_PATHS = frozenset({"/health/live", "/health/ready"})
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        arguments = record.args
+        if isinstance(arguments, tuple) and len(arguments) >= 3:
+            path = arguments[2]
+            if isinstance(path, str) and path.split("?", 1)[0] in self._HEALTHCHECK_PATHS:
+                return False
+        return True
+
+
+def _uvicorn_log_config(*, json_format: bool = False) -> dict[str, Any]:
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    if json_format:
+        log_config["formatters"]["default"] = {"()": "private_dav_mcp.gateway.JSONLogFormatter"}
+        log_config["formatters"]["access"] = {"()": "private_dav_mcp.gateway.JSONLogFormatter"}
+    log_config.setdefault("filters", {})["healthcheck"] = {
+        "()": "private_dav_mcp.gateway.HealthcheckAccessLogFilter"
+    }
+    log_config["handlers"]["access"]["filters"] = ["healthcheck"]
+    return log_config
 
 
 class GatewayAPIError(RuntimeError):
@@ -137,6 +186,15 @@ class PasswordAuthInput(BaseModel):
     username: str = Field(min_length=1, max_length=320)
     password: SecretStr = Field(min_length=1, max_length=4096)
     mode: str = Field(pattern="^(auto|basic|digest)$")
+
+
+class ResourceGrantPutInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resource_id: str = Field(min_length=1, max_length=200, pattern=r"^[a-z0-9][a-z0-9:._-]+$")
+    user_id: str = Field(min_length=1, max_length=200)
+    permission: str = Field(pattern="^(read|read_write)$")
+    enabled: bool = True
 
 
 class AccountCreateInput(BaseModel):
@@ -299,6 +357,16 @@ def _static_contact_account_from_env(env: Mapping[str, str]) -> StaticContactAcc
 
 
 @dataclass(frozen=True)
+class DAVResource:
+    resource_id: str
+    kind: str
+    label: str
+    allowed_permissions: tuple[str, ...]
+    configured: bool = True
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
 class GatewaySettings:
     db_path: str
     jwt_issuer: str
@@ -310,6 +378,7 @@ class GatewaySettings:
     allowed_host_suffixes: tuple[str, ...]
     static_accounts: tuple[StaticGatewayAccount, ...]
     static_contact_account: StaticContactAccount | None
+    require_resource_grants: bool
 
     @classmethod
     def from_env(cls) -> GatewaySettings:
@@ -351,6 +420,9 @@ class GatewaySettings:
                 *_static_ics_subscriptions_from_env(os.environ),
             ),
             static_contact_account=_static_contact_account_from_env(os.environ),
+            require_resource_grants=_bool_env(
+                os.environ, "PRIVATE_DAV_GATEWAY_REQUIRE_RESOURCE_GRANTS", False
+            ),
         )
 
 
@@ -363,6 +435,7 @@ def create_gateway_app(
     calendar_mcp: GatewayCalendarMCP | None = None,
     contacts_mcp: GatewayContactsMCP | None = None,
     settings: GatewaySettings | None = None,
+    resource_catalog: tuple[DAVResource, ...] | None = None,
 ) -> FastAPI:
     if verifier is None or store is None:
         settings = settings or GatewaySettings.from_env()
@@ -386,6 +459,13 @@ def create_gateway_app(
     url_policy = url_policy or OutboundURLPolicy()
     static_accounts = settings.static_accounts if settings is not None else ()
     static_contact_account = settings.static_contact_account if settings is not None else None
+    require_resource_grants = settings.require_resource_grants if settings is not None else False
+    if resource_catalog is None:
+        resource_catalog = _configured_resource_catalog(static_accounts, static_contact_account)
+    resource_by_id = {resource.resource_id: resource for resource in resource_catalog}
+    configured_resource_ids = (
+        set(resource_by_id) if settings is not None or resource_catalog else None
+    )
     for static_account in static_accounts:
         url_policy.validate(static_account.base_url)
     if static_contact_account is not None:
@@ -393,8 +473,13 @@ def create_gateway_app(
     calendar_mcp = calendar_mcp or GatewayCalendarMCP(
         store,
         static_accounts=static_accounts,
+        require_resource_grants=require_resource_grants,
     )
-    contacts_mcp = contacts_mcp or GatewayContactsMCP(static_contact_account, store=store)
+    contacts_mcp = contacts_mcp or GatewayContactsMCP(
+        static_contact_account,
+        store=store,
+        require_resource_grants=require_resource_grants,
+    )
     app = FastAPI(title="Private DAV Gateway", version="1")
 
     @app.exception_handler(GatewayAPIError)
@@ -529,6 +614,98 @@ def create_gateway_app(
         if result is None:
             return Response(status_code=202)
         return JSONResponse(status_code=200, content=result)
+
+    @app.get("/v1/resources")
+    async def list_resources(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_READ_SCOPE)
+        return {
+            "resources": [_resource_response(resource) for resource in resource_catalog],
+        }
+
+    @app.get("/v1/resource-grants")
+    async def list_resource_grants(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_READ_SCOPE)
+        grants = await run_in_threadpool(store.list_resource_grants, identity.tenant_id)
+        return {"grants": [_resource_grant_response(grant) for grant in grants]}
+
+    @app.get("/v1/resource-grant-audit")
+    async def list_resource_grant_audit(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+        limit: int = 100,
+        before_id: int | None = None,
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_READ_SCOPE)
+        if limit < 1 or limit > 500:
+            raise GatewayAPIError(422, "invalid_request", "Limit must be between 1 and 500.")
+        if before_id is not None and before_id < 1:
+            raise GatewayAPIError(422, "invalid_request", "Audit cursor must be positive.")
+        entries = await run_in_threadpool(
+            store.list_resource_grant_audit,
+            identity.tenant_id,
+            limit=limit + 1,
+            before_id=before_id,
+        )
+        has_more = len(entries) > limit
+        entries = entries[:limit]
+        return {
+            "entries": [_resource_grant_audit_response(entry) for entry in entries],
+            "next_cursor": entries[-1].audit_id if has_more else None,
+        }
+
+    @app.put("/v1/resource-grants")
+    async def put_resource_grant(
+        payload: ResourceGrantPutInput,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, GRANTS_WRITE_SCOPE)
+        if (
+            configured_resource_ids is not None
+            and payload.resource_id not in configured_resource_ids
+        ):
+            raise GatewayAPIError(404, "not_found", "DAV resource was not found.")
+        configured_resource = resource_by_id.get(payload.resource_id)
+        if (
+            configured_resource is not None
+            and payload.permission not in configured_resource.allowed_permissions
+        ):
+            raise GatewayAPIError(
+                422,
+                "unsupported_permission",
+                "Permission is not supported by this DAV resource.",
+                fields={"permission": "Permission is not supported by this resource."},
+            )
+        grant = await run_in_threadpool(
+            store.upsert_resource_grant,
+            resource_id=payload.resource_id,
+            tenant_id=identity.tenant_id,
+            user_id=payload.user_id,
+            permission=payload.permission,
+            enabled=payload.enabled,
+            updated_by=identity.user_id,
+        )
+        return _resource_grant_response(grant)
+
+    @app.delete("/v1/resource-grants/{resource_id}", status_code=204)
+    async def delete_resource_grant(
+        resource_id: str,
+        user_id: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> Response:
+        require_scope(identity, GRANTS_WRITE_SCOPE)
+        deleted = await run_in_threadpool(
+            store.delete_resource_grant,
+            resource_id,
+            identity.tenant_id,
+            user_id,
+            deleted_by=identity.user_id,
+        )
+        if not deleted:
+            raise GatewayAPIError(404, "not_found", "Resource grant was not found.")
+        return Response(status_code=204)
 
     @app.get("/v1/accounts")
     async def list_accounts(
@@ -770,6 +947,91 @@ def _username_hint(username: str) -> str:
     return f"{username[:1]}…{username[-1:]}"
 
 
+def _configured_resource_catalog(
+    static_accounts: tuple[StaticGatewayAccount, ...],
+    static_contact_account: StaticContactAccount | None,
+) -> tuple[DAVResource, ...]:
+    resources = [
+        DAVResource(
+            resource_id=account.resource_id,
+            kind="ics" if isinstance(account, StaticICSSubscription) else "caldav",
+            label=account.label,
+            allowed_permissions=(
+                ("read",) if isinstance(account, StaticICSSubscription) else ("read", "read_write")
+            ),
+        )
+        for account in static_accounts
+    ]
+    if static_contact_account is not None:
+        resources.append(
+            DAVResource(
+                resource_id=static_contact_account.resource_id,
+                kind="carddav",
+                label="Contacts",
+                allowed_permissions=("read", "read_write"),
+            )
+        )
+    return tuple(sorted(resources, key=lambda resource: resource.resource_id))
+
+
+def _resource_response(resource: DAVResource) -> dict[str, Any]:
+    return {
+        "resource_id": resource.resource_id,
+        "kind": resource.kind,
+        "label": resource.label,
+        "allowed_permissions": list(resource.allowed_permissions),
+        "configured": resource.configured,
+        "enabled": resource.enabled,
+    }
+
+
+def _resource_grant_response(grant: Any) -> dict[str, Any]:
+    return {
+        "resource_id": grant.resource_id,
+        "tenant_id": grant.tenant_id,
+        "user_id": grant.user_id,
+        "permission": grant.permission,
+        "enabled": grant.enabled,
+        "updated_by": grant.updated_by,
+        "created_at": grant.created_at,
+        "updated_at": grant.updated_at,
+    }
+
+
+def _resource_grant_audit_response(entry: Any) -> dict[str, Any]:
+    return {
+        "audit_id": entry.audit_id,
+        "resource_id": entry.resource_id,
+        "tenant_id": entry.tenant_id,
+        "user_id": entry.user_id,
+        "actor_id": entry.actor_id,
+        "operation": entry.operation,
+        "previous": (
+            {"permission": entry.previous_permission, "enabled": entry.previous_enabled}
+            if entry.previous_permission is not None
+            else None
+        ),
+        "resulting": (
+            {"permission": entry.resulting_permission, "enabled": entry.resulting_enabled}
+            if entry.resulting_permission is not None
+            else None
+        ),
+        "created_at": entry.created_at,
+    }
+
+
+def _bool_env(env: Mapping[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean")
+
+
 def _resolve_host(host: str) -> list[str]:
     return sorted(
         {
@@ -791,9 +1053,20 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8769)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        default=os.environ.get("PRIVATE_DAV_GATEWAY_LOG_FORMAT", "text"),
+    )
     args = parser.parse_args()
     app = create_gateway_app()
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        log_config=_uvicorn_log_config(json_format=args.log_format == "json"),
+    )
 
 
 if __name__ == "__main__":

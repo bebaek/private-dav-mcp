@@ -43,6 +43,10 @@ class StaticContactAccount:
     tenant_id: str = "*"
     user_id: str = "*"
 
+    @property
+    def resource_id(self) -> str:
+        return f"carddav:{self.account_id}"
+
     def owns(self, identity: GatewayIdentity) -> bool:
         return self.tenant_id in {"*", identity.tenant_id} and self.user_id in {
             "*",
@@ -80,10 +84,12 @@ class GatewayContactsMCP:
         *,
         server_factory: Callable[[StaticContactAccount], PrivateContactsMCPServer] | None = None,
         store: AccountStore | None = None,
+        require_resource_grants: bool = False,
     ) -> None:
         self._account = account
         self._server_factory = server_factory
         self._store = store
+        self._require_resource_grants = require_resource_grants
         self._lock = threading.RLock()
         self._servers: dict[tuple[str, str], _OwnerServer] = {}
 
@@ -96,7 +102,7 @@ class GatewayContactsMCP:
             scopes=frozenset(),
             token_id="__health__",
         )
-        self._server_for(identity).check_ready()
+        self._server_for(identity, check_grant=False).check_ready()
 
     def build_sdk_server(self, identity: GatewayIdentity) -> Server[Any]:
         return build_mcp_sdk_server(
@@ -120,17 +126,31 @@ class GatewayContactsMCP:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         try:
-            identity.require(
-                "dav:contacts:write" if name in _CONTACT_WRITE_TOOLS else "dav:contacts:read"
-            )
-            server = self._server_for(identity)
+            permission = "write" if name in _CONTACT_WRITE_TOOLS else "read"
+            identity.require("dav:contacts:write" if permission == "write" else "dav:contacts:read")
+            server = self._server_for(identity, permission=permission)
         except PermissionError as exc:
             raise MCPToolCallFailure(-32001, str(exc)) from exc
         return server.call_tool(name, arguments)
 
-    def _server_for(self, identity: GatewayIdentity) -> PrivateContactsMCPServer:
+    def _server_for(
+        self, identity: GatewayIdentity, *, permission: str = "read", check_grant: bool = True
+    ) -> PrivateContactsMCPServer:
         account = self._account
-        if account is None or not account.owns(identity):
+        if account is None:
+            raise PermissionError("Contacts are unavailable for this identity")
+        if check_grant and self._store is not None:
+            access = self._store.resource_access(
+                account.resource_id,
+                identity.tenant_id,
+                identity.user_id,
+                permission=permission,
+            )
+            if access is False or (access is None and self._require_resource_grants):
+                raise PermissionError("Contacts are unavailable for this identity")
+            if access is None and not account.owns(identity):
+                raise PermissionError("Contacts are unavailable for this identity")
+        elif check_grant and not account.owns(identity):
             raise PermissionError("Contacts are unavailable for this identity")
         key = (identity.tenant_id, identity.user_id)
         with self._lock:

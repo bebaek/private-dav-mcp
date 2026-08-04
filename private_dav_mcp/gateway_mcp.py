@@ -106,12 +106,19 @@ class StaticCalendarAccount:
     tenant_id: str = "*"
     user_id: str = "*"
 
+    @property
+    def resource_id(self) -> str:
+        return f"caldav:{self.account_id}"
+
     def for_identity(self, identity: GatewayIdentity) -> GatewayAccount | None:
         if self.tenant_id not in {"*", identity.tenant_id} or self.user_id not in {
             "*",
             identity.user_id,
         }:
             return None
+        return self.materialize(identity)
+
+    def materialize(self, identity: GatewayIdentity) -> GatewayAccount:
         owner = f"{identity.tenant_id}\0{identity.user_id}\0{self.account_id}".encode()
         account_ref = "acct_" + base64.urlsafe_b64encode(
             hashlib.sha256(owner).digest()[:18]
@@ -159,6 +166,10 @@ class StaticICSSubscription:
     user_id: str = "*"
 
     @property
+    def resource_id(self) -> str:
+        return f"ics:{self.subscription_id}"
+
+    @property
     def base_url(self) -> str:
         return self.url
 
@@ -168,6 +179,9 @@ class StaticICSSubscription:
             identity.user_id,
         }:
             return None
+        return self.materialize(identity)
+
+    def materialize(self, identity: GatewayIdentity) -> GatewayAccount:
         owner = f"{identity.tenant_id}\0{identity.user_id}\0ics\0{self.subscription_id}".encode()
         account_ref = "acct_" + base64.urlsafe_b64encode(
             hashlib.sha256(owner).digest()[:18]
@@ -223,9 +237,11 @@ class GatewayCalendarMCP:
         *,
         server_factory: Callable[[GatewayAccount], PrivateCalendarMCPServer] | None = None,
         static_accounts: tuple[StaticGatewayAccount, ...] = (),
+        require_resource_grants: bool = False,
     ) -> None:
         self._store = store
         self._static_accounts = static_accounts
+        self._require_resource_grants = require_resource_grants
         self._server_factory = server_factory
         self._lock = threading.RLock()
         self._servers: dict[tuple[str, str, str], _AccountServer] = {}
@@ -259,7 +275,10 @@ class GatewayCalendarMCP:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         try:
-            if name in {"events_create", "events_update", "events_delete"}:
+            permission = (
+                "write" if name in {"events_create", "events_update", "events_delete"} else "read"
+            )
+            if permission == "write":
                 identity.require("dav:calendar:write")
             else:
                 identity.require("dav:calendar:read")
@@ -280,7 +299,9 @@ class GatewayCalendarMCP:
             reference = arguments.get(reference_name)
             if not isinstance(reference, str) or not reference:
                 raise ValueError(f"{name} requires {reference_name}")
-            account, account_server = self._resolve_route(identity, reference, reference_type)
+            account, account_server = self._resolve_route(
+                identity, reference, reference_type, permission=permission
+            )
             if account.kind == "ics" and name in {
                 "events_create",
                 "events_update",
@@ -446,7 +467,8 @@ class GatewayCalendarMCP:
         static_accounts = [
             account
             for template in self._static_accounts
-            if (account := template.for_identity(identity)) is not None
+            if (account := self._static_account_for_identity(template, identity, "read"))
+            is not None
         ]
         dynamic_accounts = [
             account
@@ -460,9 +482,29 @@ class GatewayCalendarMCP:
             account for account in dynamic_accounts if account.account_ref not in static_refs
         ]
 
-    def _owned_enabled_account(self, identity: GatewayIdentity, account_ref: str) -> GatewayAccount:
+    def _static_account_for_identity(
+        self,
+        template: StaticGatewayAccount,
+        identity: GatewayIdentity,
+        permission: str,
+    ) -> GatewayAccount | None:
+        access = self._store.resource_access(
+            template.resource_id,
+            identity.tenant_id,
+            identity.user_id,
+            permission=permission,
+        )
+        if access is True:
+            return template.materialize(identity)
+        if access is False or self._require_resource_grants:
+            return None
+        return template.for_identity(identity)
+
+    def _owned_enabled_account(
+        self, identity: GatewayIdentity, account_ref: str, *, permission: str = "read"
+    ) -> GatewayAccount:
         for template in self._static_accounts:
-            static_account = template.for_identity(identity)
+            static_account = self._static_account_for_identity(template, identity, permission)
             if static_account is not None and static_account.account_ref == account_ref:
                 return static_account
         account = self._store.get_account(identity.tenant_id, identity.user_id, account_ref)
@@ -505,7 +547,12 @@ class GatewayCalendarMCP:
             )
 
     def _resolve_route(
-        self, identity: GatewayIdentity, reference: str, reference_type: str
+        self,
+        identity: GatewayIdentity,
+        reference: str,
+        reference_type: str,
+        *,
+        permission: str = "read",
     ) -> tuple[GatewayAccount, _AccountServer]:
         stored = self._store.get_reference(identity.tenant_id, identity.user_id, reference)
         if stored is not None:
@@ -519,7 +566,7 @@ class GatewayCalendarMCP:
                 route = self._routes.get((identity.tenant_id, identity.user_id, reference))
         if route is None or route.reference_type != reference_type:
             raise PermissionError("Unknown or expired reference")
-        account = self._owned_enabled_account(identity, route.account_ref)
+        account = self._owned_enabled_account(identity, route.account_ref, permission=permission)
         if account.updated_at != route.account_updated_at:
             raise PermissionError("Unknown or expired reference")
         return account, self._server_for(account)

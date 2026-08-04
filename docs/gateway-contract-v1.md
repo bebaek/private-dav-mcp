@@ -59,6 +59,8 @@ correlation but MUST NOT retain the token.
 | `dav:calendar:write` | Use event mutation MCP tools |
 | `dav:contacts:read` | Use contact listing, selective retrieval, and trusted protection tools |
 | `dav:contacts:write` | Use contact mutation MCP tools |
+| `dav:grants:read` | List resource grants for the authenticated tenant |
+| `dav:grants:write` | Create, update, disable, or remove grants for the authenticated tenant |
 
 `dav:accounts:write` does not imply calendar access, and `dav:calendar:write` does not permit
 credential management.
@@ -88,6 +90,66 @@ Account and calendar labels are private user data. The REST API may return them 
 user. MCP MUST protect them with the private-value envelope.
 
 ## REST management API
+
+### Resource grants
+
+Static DAV credentials remain deployment-managed, while access is stored independently in SQLite.
+Resources use stable IDs: `caldav:<account-id>`, `carddav:<account-id>`, and
+`ics:<subscription-id>`. A grant representation is:
+
+```json
+{
+  "resource_id": "caldav:primary",
+  "tenant_id": "tenant-a",
+  "user_id": "*",
+  "permission": "read_write",
+  "enabled": true,
+  "updated_by": "admin-user",
+  "created_at": "2026-08-03T20:00:00Z",
+  "updated_at": "2026-08-03T20:00:00Z"
+}
+```
+
+`user_id: "*"` grants every user in the authenticated tenant. Exact user IDs override nothing by
+themselves; access is allowed when any enabled matching grant permits the requested operation.
+`read_write` includes read access. Grant records never contain credentials or upstream URLs.
+
+```http
+GET /v1/resources
+Scope: dav:grants:read
+
+GET /v1/resource-grants
+Scope: dav:grants:read
+
+PUT /v1/resource-grants
+Scope: dav:grants:write
+
+DELETE /v1/resource-grants/{resource_id}?user_id={user_id}
+Scope: dav:grants:write
+
+GET /v1/resource-grant-audit?limit={1..500}&before_id={audit_id}
+Scope: dav:grants:read
+```
+
+The resource catalog contains only stable resource IDs, administrative labels, resource kinds,
+configuration/enabled flags, and supported permissions. It MUST NOT return upstream URLs,
+usernames, credentials, or secret-backed configuration. Labels are administrative private data and
+MUST be returned only to a scoped identity. ICS subscriptions advertise only `read`; CalDAV and
+CardDAV resources advertise `read` and `read_write`. Grant upserts MUST reject permissions not
+advertised by a configured resource.
+
+Grant create, permission change, enable, disable, no-op upsert, combined update, and delete requests
+MUST append an audit record in the same transaction as the grant mutation. Audit records include the
+resource, tenant, subject, actor, operation, previous state, resulting state, and timestamp. They
+MUST NOT contain DAV credentials or upstream URLs and MUST reject updates and deletions. The audit
+endpoint returns newest entries first, is tenant-scoped from the verified token, and returns a
+`next_cursor` suitable for the next `before_id` query.
+
+The tenant always comes from the verified token and MUST NOT be accepted in a request body. Once a
+resource has any grant rows, those rows replace legacy static owner matching for that resource.
+Deployments using `PRIVATE_DAV_GATEWAY_REQUIRE_RESOURCE_GRANTS=true` MUST deny a static resource
+that has no grant rows. Grant-management scopes are administrative and MUST NOT be included in
+normal model-facing tool identities.
 
 ### Account representation
 
