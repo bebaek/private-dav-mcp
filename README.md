@@ -71,6 +71,11 @@ The gateway process listens on port `8769` by default:
 uv run private-dav-gateway --host 127.0.0.1 --port 8769
 ```
 
+Gateway access logs omit routine `GET /health/live` and `GET /health/ready` probes. Production
+container images set `PRIVATE_DAV_GATEWAY_LOG_FORMAT=json`, emitting one JSON object per line with
+`timestamp`, `level`, `logger`, and `message`. Override it with `--log-format text` for local
+readability, or set `PRIVATE_DAV_GATEWAY_LOG_FORMAT=text` outside the production image.
+
 It requires a SQLite path, JWT issuer/public-key ring, and versioned 32-byte encryption-key ring:
 
 ```text

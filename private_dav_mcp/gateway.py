@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ipaddress
 import json
+import logging
 import os
 import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Annotated, Any, Protocol
 from urllib.parse import urlsplit
 
@@ -16,6 +19,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
+from uvicorn.config import LOGGING_CONFIG
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
 from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
@@ -38,6 +42,49 @@ ACCOUNTS_READ_SCOPE = "dav:accounts:read"
 ACCOUNTS_WRITE_SCOPE = "dav:accounts:write"
 GRANTS_READ_SCOPE = "dav:grants:read"
 GRANTS_WRITE_SCOPE = "dav:grants:write"
+
+
+class JSONLogFormatter(logging.Formatter):
+    """Render gateway logs as one JSON object per line for production collectors."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        event: dict[str, Any] = {
+            "timestamp": datetime.fromtimestamp(record.created, timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            event["exception"] = self.formatException(record.exc_info)
+        return json.dumps(event, ensure_ascii=False)
+
+
+class HealthcheckAccessLogFilter(logging.Filter):
+    """Keep routine liveness and readiness probes out of the access log."""
+
+    _HEALTHCHECK_PATHS = frozenset({"/health/live", "/health/ready"})
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        arguments = record.args
+        if isinstance(arguments, tuple) and len(arguments) >= 3:
+            path = arguments[2]
+            if isinstance(path, str) and path.split("?", 1)[0] in self._HEALTHCHECK_PATHS:
+                return False
+        return True
+
+
+def _uvicorn_log_config(*, json_format: bool = False) -> dict[str, Any]:
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    if json_format:
+        log_config["formatters"]["default"] = {"()": "private_dav_mcp.gateway.JSONLogFormatter"}
+        log_config["formatters"]["access"] = {"()": "private_dav_mcp.gateway.JSONLogFormatter"}
+    log_config.setdefault("filters", {})["healthcheck"] = {
+        "()": "private_dav_mcp.gateway.HealthcheckAccessLogFilter"
+    }
+    log_config["handlers"]["access"]["filters"] = ["healthcheck"]
+    return log_config
 
 
 class GatewayAPIError(RuntimeError):
@@ -1006,9 +1053,20 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8769)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        default=os.environ.get("PRIVATE_DAV_GATEWAY_LOG_FORMAT", "text"),
+    )
     args = parser.parse_args()
     app = create_gateway_app()
-    uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
+    uvicorn.run(
+        app,
+        host=args.host,
+        port=args.port,
+        log_level=args.log_level,
+        log_config=_uvicorn_log_config(json_format=args.log_format == "json"),
+    )
 
 
 if __name__ == "__main__":

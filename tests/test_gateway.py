@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import sqlite3
 import stat
 import time
@@ -27,7 +28,10 @@ from private_dav_mcp.gateway import (
     AccountConnectionError,
     DAVResource,
     GatewaySettings,
+    HealthcheckAccessLogFilter,
+    JSONLogFormatter,
     OutboundURLPolicy,
+    _uvicorn_log_config,
     create_gateway_app,
 )
 from private_dav_mcp.gateway_contacts import (
@@ -52,6 +56,57 @@ from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 
 ISSUER = "https://minigent.example"
 AUDIENCE = "private-dav"
+
+
+def test_json_log_formatter_emits_structured_event() -> None:
+    formatter = JSONLogFormatter()
+    record = logging.makeLogRecord(
+        {
+            "name": "uvicorn.access",
+            "levelno": logging.INFO,
+            "levelname": "INFO",
+            "msg": "%s - %s",
+            "args": ("127.0.0.1", "/mcp"),
+            "created": 0,
+        }
+    )
+
+    assert json.loads(formatter.format(record)) == {
+        "timestamp": "1970-01-01T00:00:00.000Z",
+        "level": "INFO",
+        "logger": "uvicorn.access",
+        "message": "127.0.0.1 - /mcp",
+    }
+
+
+def test_healthcheck_access_logs_are_suppressed() -> None:
+    access_filter = HealthcheckAccessLogFilter()
+
+    assert not access_filter.filter(
+        logging.makeLogRecord({"args": ("127.0.0.1", "GET", "/health/live", "1.1", 200)})
+    )
+    assert not access_filter.filter(
+        logging.makeLogRecord({"args": ("127.0.0.1", "GET", "/health/ready?verbose=1", "1.1", 503)})
+    )
+    assert access_filter.filter(
+        logging.makeLogRecord({"args": ("127.0.0.1", "POST", "/mcp", "1.1", 200)})
+    )
+
+
+def test_uvicorn_log_config_installs_healthcheck_filter() -> None:
+    log_config = _uvicorn_log_config()
+
+    assert log_config["filters"]["healthcheck"] == {
+        "()": "private_dav_mcp.gateway.HealthcheckAccessLogFilter"
+    }
+    assert log_config["handlers"]["access"]["filters"] == ["healthcheck"]
+    json_log_config = _uvicorn_log_config(json_format=True)
+    assert json_log_config["formatters"]["default"] == {
+        "()": "private_dav_mcp.gateway.JSONLogFormatter"
+    }
+    assert json_log_config["formatters"]["access"] == {
+        "()": "private_dav_mcp.gateway.JSONLogFormatter"
+    }
 
 
 class FakeConnector:
