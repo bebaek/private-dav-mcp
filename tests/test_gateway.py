@@ -22,7 +22,13 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from fastapi.testclient import TestClient
 
-from private_dav_mcp.caldav import CachedReference, Calendar, Event, PrivateCalendarMCPServer
+from private_dav_mcp.caldav import (
+    CachedReference,
+    Calendar,
+    Event,
+    PrivateCalendarMCPServer,
+    StaticCalendarSource,
+)
 from private_dav_mcp.carddav import CachedContact, Contact, PrivateContactsMCPServer
 from private_dav_mcp.gateway import (
     AccountConnectionError,
@@ -49,7 +55,12 @@ from private_dav_mcp.gateway_mcp import (
     _encode_calendar_reference,
 )
 from private_dav_mcp.gateway_references import DurableReferenceCache
-from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
+from private_dav_mcp.gateway_store import (
+    AccountCipher,
+    AccountStore,
+    GatewayAccount,
+    PasswordCredential,
+)
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 from private_dav_mcp.mcp_sdk import SDK_MCP_PROTOCOL_VERSION, MCPToolCallFailure
 from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
@@ -1051,6 +1062,208 @@ def test_tenant_account_lifecycle_is_scoped_idempotent_and_atomic(
         assert b"Renamed tenant calendar" not in content
 
 
+def test_shared_tenant_account_mcp_is_grant_aware_and_caller_bound(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, _db_path = gateway
+    tenant_admin = _headers(
+        private_pem,
+        scopes="dav:tenant-accounts:write dav:account-grants:write",
+    )
+    payload = _account_payload(password="shared-mcp-secret")
+    payload["label"] = "Shared MCP calendar"
+    payload["initial_access"] = {"user_id": "user-a", "permission": "read_write"}
+    created = client.post("/v1/tenant/accounts", headers=tenant_admin, json=payload)
+    assert created.status_code == 201, created.text
+    account_ref = created.json()["account_ref"]
+    grant_url = f"/v1/tenant/accounts/{account_ref}/grants"
+    for user_id, permission in (("user-b", "read_write"), ("user-c", "read")):
+        response = client.put(
+            grant_url,
+            headers=tenant_admin,
+            json={"user_id": user_id, "permission": permission, "enabled": True},
+        )
+        assert response.status_code == 200, response.text
+
+    user_a = _headers(
+        private_pem,
+        user_id="user-a",
+        scopes="dav:calendar:read dav:calendar:write",
+    )
+    user_b = _headers(
+        private_pem,
+        user_id="user-b",
+        scopes="dav:calendar:read dav:calendar:write",
+    )
+    user_c = _headers(
+        private_pem,
+        user_id="user-c",
+        scopes="dav:calendar:read dav:calendar:write",
+    )
+    ungranted_admin = _headers(
+        private_pem,
+        user_id="admin-no-access",
+        scopes="dav:calendar:read dav:tenant-accounts:read dav:tenant-accounts:write",
+    )
+
+    for headers in (user_a, user_b, user_c):
+        accounts = _mcp(
+            client,
+            headers,
+            "tools/call",
+            {"name": "calendar_accounts_list", "arguments": {}},
+        )["result"]
+        assert account_ref in {
+            account["account_ref"] for account in accounts["structuredContent"]["accounts"]
+        }
+        assert "Shared MCP calendar" not in str(accounts["structuredContent"])
+
+    denied_admin = _mcp(
+        client,
+        ungranted_admin,
+        "tools/call",
+        {"name": "calendars_list", "arguments": {"account_ref": account_ref}},
+    )
+    assert denied_admin["error"]["code"] == -32001
+
+    def calendar_ref(headers: dict[str, str]) -> str:
+        result = _mcp(
+            client,
+            headers,
+            "tools/call",
+            {"name": "calendars_list", "arguments": {"account_ref": account_ref}},
+        )["result"]
+        calendars = result["structuredContent"]["calendars"]
+        assert len(calendars) == 1
+        return calendars[0]["calendar_ref"]
+
+    calendar_a = calendar_ref(user_a)
+    calendar_b = calendar_ref(user_b)
+    calendar_c = calendar_ref(user_c)
+    assert len({calendar_a, calendar_b, calendar_c}) == 3
+
+    cross_caller = _mcp(
+        client,
+        user_b,
+        "tools/call",
+        {
+            "name": "events_list",
+            "arguments": {
+                "calendar_ref": calendar_a,
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )
+    assert cross_caller["error"]["code"] == -32001
+
+    read_only_write = _mcp(
+        client,
+        user_c,
+        "tools/call",
+        {
+            "name": "events_create",
+            "arguments": {
+                "calendar_ref": calendar_c,
+                "summary": "Denied shared mutation",
+                "start": "2026-08-01T10:00:00Z",
+                "end": "2026-08-01T11:00:00Z",
+            },
+        },
+    )
+    assert read_only_write["error"]["code"] == -32001
+
+    allowed_write = _mcp(
+        client,
+        user_b,
+        "tools/call",
+        {
+            "name": "events_create",
+            "arguments": {
+                "calendar_ref": calendar_b,
+                "summary": "Allowed shared mutation",
+                "start": "2026-08-01T10:00:00Z",
+                "end": "2026-08-01T11:00:00Z",
+            },
+        },
+    )
+    assert allowed_write["result"]["structuredContent"]["status"] == "created"
+
+    revoked = client.delete(f"{grant_url}/user-b", headers=tenant_admin)
+    assert revoked.status_code == 204
+    revoked_reference = _mcp(
+        client,
+        user_b,
+        "tools/call",
+        {
+            "name": "events_list",
+            "arguments": {
+                "calendar_ref": calendar_b,
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )
+    assert revoked_reference["error"]["code"] == -32001
+
+    renamed = client.patch(
+        f"/v1/tenant/accounts/{account_ref}",
+        headers=tenant_admin,
+        json={"label": "Updated shared calendar"},
+    )
+    assert renamed.status_code == 200
+    stale_reference = _mcp(
+        client,
+        user_a,
+        "tools/call",
+        {
+            "name": "events_list",
+            "arguments": {
+                "calendar_ref": calendar_a,
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )
+    assert stale_reference["error"]["code"] == -32001
+    current_calendar_a = calendar_ref(user_a)
+
+    disabled = client.patch(
+        f"/v1/tenant/accounts/{account_ref}",
+        headers=tenant_admin,
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["status"] == "disabled"
+    disabled_accounts = _mcp(
+        client,
+        user_a,
+        "tools/call",
+        {"name": "calendar_accounts_list", "arguments": {}},
+    )["result"]
+    assert account_ref not in {
+        account["account_ref"] for account in disabled_accounts["structuredContent"]["accounts"]
+    }
+    disabled_reference = _mcp(
+        client,
+        user_a,
+        "tools/call",
+        {
+            "name": "events_list",
+            "arguments": {
+                "calendar_ref": current_calendar_a,
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )
+    assert disabled_reference["error"]["code"] == -32001
+
+    assert (
+        client.delete(f"/v1/tenant/accounts/{account_ref}", headers=tenant_admin).status_code == 204
+    )
+
+
 def test_resource_grants_support_tenant_and_user_permissions(tmp_path: Path) -> None:
     store = AccountStore(
         tmp_path / "grants.db",
@@ -1387,6 +1600,92 @@ def test_static_carddav_account_is_authenticated_and_owner_scoped() -> None:
     with pytest.raises(MCPToolCallFailure) as exc_info:
         broker.call_tool(owner, "contacts_create", {"name": "New Person"})
     assert exc_info.value.code == -32001
+
+
+def test_shared_account_durable_references_are_caller_bound_across_instances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "shared-account.db"
+    store = AccountStore(
+        database,
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    account, _created = store.create_tenant_account(
+        tenant_id="tenant-a",
+        actor_user_id="admin-a",
+        kind="caldav",
+        label="Shared durable calendar",
+        base_url="https://dav.example/shared/",
+        credential=PasswordCredential(username="shared", password="secret", mode="basic"),
+        enabled=True,
+        status="ready",
+        last_error=None,
+        idempotency_key=None,
+        request_hash=None,
+        initial_access=("user-a", "read_write"),
+    )
+    store.upsert_account_grant(
+        account_ref=account.account_ref,
+        tenant_id="tenant-a",
+        user_id="user-b",
+        permission="read_write",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    monkeypatch.setattr(
+        "private_dav_mcp.gateway_mcp.CalDAVCalendarSource",
+        lambda **_kwargs: StaticCalendarSource(
+            calendars=[Calendar("Shared", "https://dav.example/shared/calendar/")],
+            events=[
+                Event(
+                    "Shared event",
+                    "2026-08-01T14:00:00Z",
+                    "2026-08-01T15:00:00Z",
+                )
+            ],
+        ),
+    )
+    user_a = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        scopes=frozenset({"dav:calendar:read", "dav:calendar:write"}),
+        token_id="token-a",
+    )
+    user_b = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-b",
+        scopes=frozenset({"dav:calendar:read", "dav:calendar:write"}),
+        token_id="token-b",
+    )
+    gateway_a = GatewayCalendarMCP(store)
+    gateway_b = GatewayCalendarMCP(store)
+
+    listed = gateway_a.call_tool(user_a, "calendars_list", {})
+    calendar_ref = listed["structuredContent"]["calendars"][0]["calendar_ref"]
+    selected = gateway_b.call_tool(
+        user_a,
+        "events_list",
+        {
+            "calendar_ref": calendar_ref,
+            "start": "2026-08-01T00:00:00Z",
+            "end": "2026-08-02T00:00:00Z",
+        },
+    )
+    assert len(selected["structuredContent"]["events"]) == 1
+
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        gateway_b.call_tool(
+            user_b,
+            "events_list",
+            {
+                "calendar_ref": calendar_ref,
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        )
+    assert exc_info.value.code == -32001
+    assert store.list_references("tenant-a", "user-a", account.account_ref)
+    assert store.list_references("tenant-a", "user-b", account.account_ref) == []
 
 
 def test_durable_references_resolve_across_gateway_instances(tmp_path: Path) -> None:
