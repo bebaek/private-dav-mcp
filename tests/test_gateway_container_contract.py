@@ -155,6 +155,7 @@ def test_gateway_health_authentication_and_discovery() -> None:
             "version": __version__,
         }
         assert [tool["name"] for tool in contacts.request("tools/list")["result"]["tools"]] == [
+            "contact_accounts_list",
             "contacts_list",
             "contacts_get",
             "contacts_create",
