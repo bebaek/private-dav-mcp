@@ -209,12 +209,27 @@ mutation additionally requires `read_write`. Users sharing one account receive i
 caller-bound calendar and event references. Revoking a grant takes effect on the next operation, and
 account updates, disablement, or deletion invalidate outstanding references for every grantee.
 
+Static CalDAV credentials can be imported into the encrypted tenant-account vault without sending
+secrets through an API payload:
+
+```text
+POST /v1/tenant/static-resources/{resource_id}/migrate
+```
+
+The authenticated tenant must have `dav:tenant-accounts:write`, `dav:account-grants:write`, and
+`dav:grants:read`. The gateway validates the configured upstream, atomically creates one tenant-owned
+account, and copies enabled static resource grants. Retrying an unchanged migration returns the same
+account. After verifying traffic through the returned account, remove the static resource from the
+deployment configuration; migration deliberately does not alter environment configuration at
+runtime.
+
 Implemented interfaces:
 
 - `GET /v1/resources`
 - `GET/PUT /v1/resource-grants`
 - `DELETE /v1/resource-grants/{resource_id}?user_id=...`
 - `GET /v1/resource-grant-audit?limit=...&before_id=...`
+- `POST /v1/tenant/static-resources/{resource_id}/migrate`
 - `GET/POST /v1/tenant/accounts`
 - `GET/PATCH/DELETE /v1/tenant/accounts/{account_ref}`
 - `POST /v1/tenant/accounts/{account_ref}/test`

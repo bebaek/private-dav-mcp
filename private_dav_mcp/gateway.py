@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import ipaddress
 import json
 import logging
@@ -489,6 +490,11 @@ def create_gateway_app(
     if resource_catalog is None:
         resource_catalog = _configured_resource_catalog(static_accounts, static_contact_account)
     resource_by_id = {resource.resource_id: resource for resource in resource_catalog}
+    static_caldav_by_resource = {
+        account.resource_id: account
+        for account in static_accounts
+        if isinstance(account, StaticCalendarAccount)
+    }
     configured_resource_ids = (
         set(resource_by_id) if settings is not None or resource_catalog else None
     )
@@ -733,6 +739,103 @@ def create_gateway_app(
         if not deleted:
             raise GatewayAPIError(404, "not_found", "Resource grant was not found.")
         return Response(status_code=204)
+
+    @app.post("/v1/tenant/static-resources/{resource_id}/migrate")
+    async def migrate_static_caldav_resource(
+        resource_id: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> Response:
+        require_scope(identity, TENANT_ACCOUNTS_WRITE_SCOPE)
+        require_scope(identity, ACCOUNT_GRANTS_WRITE_SCOPE)
+        require_scope(identity, GRANTS_READ_SCOPE)
+        static_account = static_caldav_by_resource.get(resource_id)
+        if static_account is None or static_account.tenant_id not in {
+            "*",
+            identity.tenant_id,
+        }:
+            raise GatewayAPIError(404, "not_found", "Static CalDAV resource was not found.")
+        base_url = await _validate_url(url_policy, static_account.base_url)
+        credential = PasswordCredential(
+            username=static_account.username,
+            password=static_account.password,
+            mode=static_account.auth_mode,
+        )
+        candidate = _candidate_tenant_account(
+            identity.tenant_id,
+            "caldav",
+            static_account.label,
+            base_url,
+            credential,
+            True,
+        )
+        calendar_count = await _test_account(connector, candidate)
+        resource_grants = await run_in_threadpool(store.list_resource_grants, identity.tenant_id)
+        access_entries = tuple(
+            sorted(
+                (
+                    (grant.user_id, grant.permission)
+                    for grant in resource_grants
+                    if grant.resource_id == resource_id and grant.enabled
+                ),
+                key=lambda entry: entry[0],
+            )
+        )
+        if len(access_entries) > 500:
+            raise GatewayAPIError(
+                409,
+                "account_grant_limit_reached",
+                "Tenant account grant limit was reached.",
+            )
+        if not access_entries and not require_resource_grants:
+            access_entries = ((static_account.user_id, "read_write"),)
+        migration_payload = {
+            "resource_id": resource_id,
+            "label": static_account.label,
+            "base_url": base_url,
+            "username": static_account.username,
+            "password": static_account.password,
+            "auth_mode": static_account.auth_mode,
+            "access": access_entries,
+        }
+        migration_key = (
+            "static-caldav:"
+            + hashlib.sha256(f"{identity.tenant_id}\0{resource_id}".encode()).hexdigest()
+        )
+        try:
+            account, created = await run_in_threadpool(
+                store.create_tenant_account,
+                tenant_id=identity.tenant_id,
+                actor_user_id=identity.user_id,
+                kind="caldav",
+                label=static_account.label,
+                base_url=base_url,
+                credential=credential,
+                enabled=True,
+                status="ready",
+                last_error=None,
+                idempotency_key=migration_key,
+                request_hash=store.request_hash(migration_payload),
+                initial_accesses=access_entries,
+                audit_operation="tenant_account.migrate",
+            )
+        except ValueError as exc:
+            raise GatewayAPIError(
+                409,
+                "migration_conflict",
+                "Static resource configuration changed after migration.",
+            ) from exc
+        except OverflowError as exc:
+            raise GatewayAPIError(
+                409, "account_limit_reached", "Tenant account limit was reached."
+            ) from exc
+        response = {
+            "source_resource_id": resource_id,
+            "created": created,
+            "grant_count": len(access_entries),
+            "calendar_count": calendar_count,
+            "account": _account_response(account),
+        }
+        return JSONResponse(status_code=201 if created else 200, content=response)
 
     @app.get("/v1/tenant/accounts")
     async def list_tenant_accounts(

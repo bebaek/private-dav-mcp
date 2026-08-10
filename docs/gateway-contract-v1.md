@@ -387,6 +387,39 @@ Returns `204`. Deletion removes the encrypted credential record, calendar prefer
 DEK, and outstanding references. Audit retention MAY keep non-sensitive identifiers and outcome
 codes but MUST NOT keep labels, credentials, URLs, usernames, or event fields.
 
+### Migrate a configured static CalDAV resource
+
+```http
+POST /v1/tenant/static-resources/{resource_id}/migrate
+Scopes: dav:tenant-accounts:write dav:account-grants:write dav:grants:read
+```
+
+This administrative route takes no credential payload. It resolves a configured static CalDAV
+resource visible to the authenticated tenant, applies outbound URL policy, and performs live DAV
+discovery before importing it. Missing resources, ICS subscriptions, CardDAV resources, and static
+resources explicitly bound to another tenant return the same `404` response.
+
+The account credential MUST be encrypted through the normal tenant-account vault path. The new
+account has `owner_type: "tenant"`. All enabled static resource grants for the authenticated tenant
+MUST become account grants with the same user and permission in the same transaction as account
+creation. When legacy ownership fallback is enabled and no explicit resource grant exists, the
+configured static `user_id` becomes one `read_write` account grant; this includes `*` when the static
+resource was tenant-wide. When fail-closed resource grants are required, an ungranted resource is
+imported without DAV data access.
+
+Migration uses a deterministic tenant/resource idempotency key. An unchanged retry returns `200`,
+`created: false`, and the original account; initial creation returns `201` and `created: true`.
+Changes to the configured credential, URL, label, auth mode, or grant snapshot after a successful
+migration return `409 migration_conflict` rather than creating another account. The response includes
+the non-sensitive account representation, source resource ID, copied grant count, and discovered
+calendar count, but never includes configured credentials. Creation writes a non-sensitive
+`tenant_account.migrate` audit event; copied grants retain their normal grant-create audit records.
+
+The route does not mutate process environment or deployment configuration. Operators MUST verify
+traffic through the imported account and then remove the static resource configuration in a separate
+deployment cutover. Removing it before a successful import makes the migration route unavailable;
+leaving it configured can expose both static and imported account entries during the transition.
+
 ### Tenant-owned account lifecycle
 
 Tenant-owned accounts use the same validation, secret handling, connection testing, and
