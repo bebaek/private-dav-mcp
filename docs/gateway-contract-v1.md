@@ -680,20 +680,38 @@ mutation. The gateway records a non-sensitive mutation audit event containing re
 user, account record ID, operation, outcome, request correlation ID, and timestamp—never event
 fields.
 
-### Static CardDAV compatibility endpoint
+### Multi-account CardDAV MCP endpoint
 
-`POST /contacts/mcp` exposes the contact tools from `docs/contract-v1.md` through the same bearer
-identity verifier. `contacts_list`, `contacts_get`, and `contacts_protect_text` require
-`dav:contacts:read`; `contacts_create`, `contacts_update`, and `contacts_delete` require
-`dav:contacts:write`.
+`POST /contacts/mcp` exposes the contact tools from `docs/contract-v1.md` plus
+`contact_accounts_list` through the same bearer identity verifier. `contact_accounts_list`,
+`contacts_list`, `contacts_get`, and `contacts_protect_text` require `dav:contacts:read`;
+`contacts_create`, `contacts_update`, and `contacts_delete` require `dav:contacts:write`.
 
-The initial gateway implementation accepts one secret-backed static CardDAV account. It creates an
-independent encrypted opaque-reference namespace for each authenticated tenant/user. References
-persist in the shared gateway SQLite store and resolve across gateway processes. Cross-caller,
-unconfigured-caller, and unknown contact references return non-enumerating errors. The endpoint
-preserves private-value envelopes and ETag mutation behavior. API-managed CardDAV account lifecycle
-is available through the personal and tenant account routes, but account-backed CardDAV MCP routing
-is outside this compatibility milestone.
+`contact_accounts_list` returns enabled personal CardDAV accounts, granted tenant-owned CardDAV
+accounts, and any authorized static compatibility account. Labels are protected private values and
+account references are opaque internal identifiers. `contacts_list` accepts an optional
+`account_ref`; without one it returns a bounded aggregate across all accessible contact accounts.
+`contacts_create` accepts `account_ref` and requires it whenever the writable destination is not
+unambiguous. Contact references returned by listing, trusted protection, and creation route later
+get, update, and delete calls to exactly one caller and account.
+
+DAV scopes compose with account access exactly as they do for calendars. Reads require effective
+`read` or `read_write`; mutations require `read_write`. Administrative scopes do not imply contact
+data access. Revocation applies on the next operation, and account update, disablement, or deletion
+invalidates outstanding references. Callers sharing a tenant account receive separate durable
+reference namespaces, and cross-caller references fail with the same non-enumerating error as
+unknown, expired, or unauthorized references.
+
+`contacts_protect_text` evaluates aliases across all accessible address books as one namespace. A
+full, first, or last name duplicated between accounts is ambiguous and is not replaced. Unique
+matches are cached in the owning account's caller-bound namespace. Contact listing may skip failed
+providers, but trusted protection fails closed if any accessible account cannot be evaluated. If
+every account selected for listing fails, the gateway returns an execution error.
+
+A configured static CardDAV account remains available as a compatibility source and retains static
+resource-grant enforcement. Its references continue to persist in the shared gateway SQLite store
+and resolve across gateway processes. The endpoint preserves private-value envelopes, conditional
+ETag mutation behavior, and existing single-account calls that omit `account_ref`.
 
 ## Errors
 

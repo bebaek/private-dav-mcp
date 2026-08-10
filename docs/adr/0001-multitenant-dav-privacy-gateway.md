@@ -33,9 +33,9 @@ We will evolve this repository into a **multi-tenant DAV privacy gateway**. The 
 Both interfaces will use the same authorization, encrypted account vault, DAV adapters, reference
 store, private-value envelope, and audit subsystem.
 
-The first account-backed MCP scope is CalDAV. CardDAV account lifecycle now uses the same identity
-and encrypted vault foundation, while CardDAV MCP data access continues through the compatibility
-endpoint until account-backed contact routing is migrated separately.
+The first account-backed MCP scope was CalDAV. CardDAV account lifecycle and multi-account MCP data
+access now use the same identity, encrypted vault, access-policy, and durable-reference foundation;
+the configured CardDAV source remains available only as a compatibility input to that endpoint.
 
 ### Identity boundary
 
