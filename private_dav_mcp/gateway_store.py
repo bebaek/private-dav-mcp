@@ -27,7 +27,8 @@ class PasswordCredential:
 class GatewayAccount:
     account_ref: str
     tenant_id: str
-    user_id: str
+    owner_type: str
+    owner_user_id: str | None
     kind: str
     label: str
     base_url: str
@@ -38,6 +39,22 @@ class GatewayAccount:
     last_error: str | None
     created_at: str
     updated_at: str
+
+    def __post_init__(self) -> None:
+        if self.owner_type == "user":
+            if not self.owner_user_id:
+                raise ValueError("User-owned accounts require an owner user ID")
+        elif self.owner_type == "tenant":
+            if self.owner_user_id is not None:
+                raise ValueError("Tenant-owned accounts cannot have an owner user ID")
+        else:
+            raise ValueError("Account owner type must be user or tenant")
+
+    @property
+    def user_id(self) -> str:
+        if self.owner_type != "user" or self.owner_user_id is None:
+            raise RuntimeError("Tenant-owned accounts do not have an owner user ID")
+        return self.owner_user_id
 
 
 @dataclass(frozen=True)
@@ -197,7 +214,8 @@ class AccountStore:
         account = GatewayAccount(
             account_ref=account_ref,
             tenant_id=tenant_id,
-            user_id=user_id,
+            owner_type="user",
+            owner_user_id=user_id,
             kind=kind,
             label=label,
             base_url=base_url,
@@ -276,8 +294,8 @@ class AccountStore:
                 """
                 UPDATE dav_accounts SET
                   label_cipher = ?, base_url_cipher = ?, auth_cipher = ?, wrapped_dek = ?,
-                  key_version = ?, auth_type = ?, auth_mode = ?, status = ?, enabled = ?,
-                  last_checked_at = ?, last_error = ?, updated_at = ?
+                  key_version = ?, aad_version = ?, auth_type = ?, auth_mode = ?, status = ?,
+                  enabled = ?, last_checked_at = ?, last_error = ?, updated_at = ?
                 WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
                 """,
                 (
@@ -286,6 +304,7 @@ class AccountStore:
                     encrypted["auth_cipher"],
                     encrypted["wrapped_dek"],
                     encrypted["key_version"],
+                    encrypted["aad_version"],
                     "password",
                     updated.credential.mode,
                     updated.status,
@@ -332,15 +351,18 @@ class AccountStore:
         connection.execute(
             """
             INSERT INTO dav_accounts (
-              account_ref, tenant_id, user_id, kind, label_cipher, base_url_cipher, auth_cipher,
-              wrapped_dek, key_version, auth_type, auth_mode, status, enabled, last_checked_at,
-              last_error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              account_ref, tenant_id, user_id, owner_type, owner_user_id, aad_version, kind,
+              label_cipher, base_url_cipher, auth_cipher, wrapped_dek, key_version, auth_type,
+              auth_mode, status, enabled, last_checked_at, last_error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 account.account_ref,
                 account.tenant_id,
                 account.user_id,
+                account.owner_type,
+                account.owner_user_id,
+                encrypted["aad_version"],
                 account.kind,
                 encrypted["label_cipher"],
                 encrypted["base_url_cipher"],
@@ -372,7 +394,12 @@ class AccountStore:
 
     def _encrypt_account(self, account: GatewayAccount) -> dict[str, bytes | int]:
         data_key = self._cipher.new_data_key()
-        owner_aad = _account_aad(account.tenant_id, account.user_id, account.account_ref)
+        owner_aad = _account_aad_v2(
+            account.tenant_id,
+            account.owner_type,
+            account.owner_user_id,
+            account.account_ref,
+        )
         key_version, wrapped = self._cipher.wrap_data_key(data_key, owner_aad=owner_aad)
         auth = json.dumps(
             {
@@ -392,10 +419,23 @@ class AccountStore:
             "auth_cipher": self._cipher.encrypt_field(data_key, auth, aad=owner_aad + b"|auth"),
             "wrapped_dek": wrapped,
             "key_version": key_version,
+            "aad_version": 2,
         }
 
     def _decode_account(self, row: sqlite3.Row) -> GatewayAccount:
-        owner_aad = _account_aad(row["tenant_id"], row["user_id"], row["account_ref"])
+        owner_type = str(row["owner_type"])
+        owner_user_id = str(row["owner_user_id"]) if row["owner_user_id"] is not None else None
+        aad_version = int(row["aad_version"])
+        if aad_version == 1:
+            owner_aad = _account_aad_v1(
+                str(row["tenant_id"]), str(row["user_id"]), str(row["account_ref"])
+            )
+        elif aad_version == 2:
+            owner_aad = _account_aad_v2(
+                str(row["tenant_id"]), owner_type, owner_user_id, str(row["account_ref"])
+            )
+        else:
+            raise RuntimeError("Account encryption AAD version is unsupported")
         data_key = self._cipher.unwrap_data_key(
             row["wrapped_dek"], key_version=row["key_version"], owner_aad=owner_aad
         )
@@ -405,7 +445,8 @@ class AccountStore:
         return GatewayAccount(
             account_ref=row["account_ref"],
             tenant_id=row["tenant_id"],
-            user_id=row["user_id"],
+            owner_type=owner_type,
+            owner_user_id=owner_user_id,
             kind=row["kind"],
             label=self._cipher.decrypt_field(
                 data_key, row["label_cipher"], aad=owner_aad + b"|label"
@@ -870,6 +911,10 @@ class AccountStore:
                   account_ref TEXT PRIMARY KEY,
                   tenant_id TEXT NOT NULL,
                   user_id TEXT NOT NULL,
+                  owner_type TEXT NOT NULL DEFAULT 'user'
+                    CHECK (owner_type IN ('user', 'tenant')),
+                  owner_user_id TEXT,
+                  aad_version INTEGER NOT NULL DEFAULT 1 CHECK (aad_version IN (1, 2)),
                   kind TEXT NOT NULL CHECK (kind = 'caldav'),
                   label_cipher BLOB NOT NULL,
                   base_url_cipher BLOB NOT NULL,
@@ -887,6 +932,8 @@ class AccountStore:
                 );
                 CREATE INDEX IF NOT EXISTS dav_accounts_owner
                   ON dav_accounts (tenant_id, user_id, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS dav_accounts_tenant_ref
+                  ON dav_accounts (account_ref, tenant_id);
 
                 CREATE TABLE IF NOT EXISTS account_idempotency (
                   tenant_id TEXT NOT NULL,
@@ -897,6 +944,56 @@ class AccountStore:
                   created_at TEXT NOT NULL,
                   PRIMARY KEY (tenant_id, user_id, idempotency_key)
                 );
+
+                CREATE TABLE IF NOT EXISTS dav_account_grants (
+                  account_ref TEXT NOT NULL,
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  permission TEXT NOT NULL CHECK (permission IN ('read', 'read_write')),
+                  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                  updated_by TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (account_ref, tenant_id, user_id),
+                  FOREIGN KEY (account_ref, tenant_id)
+                    REFERENCES dav_accounts(account_ref, tenant_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS dav_account_grants_subject
+                  ON dav_account_grants (tenant_id, user_id, account_ref);
+
+                CREATE TABLE IF NOT EXISTS dav_account_grant_audit (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  account_ref TEXT NOT NULL,
+                  tenant_id TEXT NOT NULL,
+                  user_id TEXT NOT NULL,
+                  actor_id TEXT NOT NULL,
+                  operation TEXT NOT NULL,
+                  previous_permission TEXT CHECK (
+                    previous_permission IS NULL OR previous_permission IN ('read', 'read_write')
+                  ),
+                  previous_enabled INTEGER CHECK (
+                    previous_enabled IS NULL OR previous_enabled IN (0, 1)
+                  ),
+                  resulting_permission TEXT CHECK (
+                    resulting_permission IS NULL OR resulting_permission IN ('read', 'read_write')
+                  ),
+                  resulting_enabled INTEGER CHECK (
+                    resulting_enabled IS NULL OR resulting_enabled IN (0, 1)
+                  ),
+                  created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS dav_account_grant_audit_tenant
+                  ON dav_account_grant_audit (tenant_id, id DESC);
+                CREATE TRIGGER IF NOT EXISTS dav_account_grant_audit_no_update
+                  BEFORE UPDATE ON dav_account_grant_audit
+                  BEGIN
+                    SELECT RAISE(ABORT, 'account grant audit is append-only');
+                  END;
+                CREATE TRIGGER IF NOT EXISTS dav_account_grant_audit_no_delete
+                  BEFORE DELETE ON dav_account_grant_audit
+                  BEGIN
+                    SELECT RAISE(ABORT, 'account grant audit is append-only');
+                  END;
 
                 CREATE TABLE IF NOT EXISTS dav_references (
                   token_hash TEXT PRIMARY KEY,
@@ -970,7 +1067,38 @@ class AccountStore:
                   outcome TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 4;
+                PRAGMA user_version = 5;
+                """
+            )
+            account_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(dav_accounts)")
+            }
+            if "owner_type" not in account_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE dav_accounts ADD COLUMN owner_type TEXT NOT NULL DEFAULT 'user'
+                    CHECK (owner_type IN ('user', 'tenant'))
+                    """
+                )
+            if "owner_user_id" not in account_columns:
+                connection.execute("ALTER TABLE dav_accounts ADD COLUMN owner_user_id TEXT")
+            if "aad_version" not in account_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE dav_accounts ADD COLUMN aad_version INTEGER NOT NULL DEFAULT 1
+                    CHECK (aad_version IN (1, 2))
+                    """
+                )
+            connection.execute(
+                """
+                UPDATE dav_accounts SET owner_user_id = user_id
+                WHERE owner_type = 'user' AND owner_user_id IS NULL
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS dav_accounts_ownership
+                ON dav_accounts (tenant_id, owner_type, owner_user_id, created_at)
                 """
             )
             reference_columns = {
@@ -994,9 +1122,9 @@ class AccountStore:
                     );
                     CREATE INDEX dav_references_owner
                       ON dav_references (tenant_id, user_id, account_ref, reference_type);
-                    PRAGMA user_version = 4;
                     """
                 )
+            connection.execute("PRAGMA user_version = 5")
 
 
 def _resource_grant_from_row(row: sqlite3.Row) -> ResourceGrant:
@@ -1050,8 +1178,22 @@ def _resource_grant_operation(previous: sqlite3.Row | None, resulting: sqlite3.R
     return "resource_grant.touch"
 
 
-def _account_aad(tenant_id: str, user_id: str, account_ref: str) -> bytes:
+def _account_aad_v1(tenant_id: str, user_id: str, account_ref: str) -> bytes:
     return f"private-dav|{tenant_id}|{user_id}|{account_ref}".encode()
+
+
+def _account_aad_v2(
+    tenant_id: str,
+    owner_type: str,
+    owner_user_id: str | None,
+    account_ref: str,
+) -> bytes:
+    ownership = json.dumps(
+        [tenant_id, owner_type, owner_user_id, account_ref],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    return b"private-dav-account-v2|" + ownership
 
 
 def _reference_hash(reference: str) -> str:

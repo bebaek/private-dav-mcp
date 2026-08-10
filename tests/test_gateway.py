@@ -273,6 +273,7 @@ def test_account_lifecycle_is_owner_scoped_and_credentials_are_write_only(
     assert create_response.status_code == 201, create_response.text
     created = create_response.json()
     account_ref = created["account_ref"]
+    assert created["owner_type"] == "user"
     assert created["calendar_count"] == 2
     assert created["label"] == "Private calendar canary"
     assert created["username_hint"] == "a…@example.com"
