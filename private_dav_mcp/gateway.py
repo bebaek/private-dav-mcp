@@ -43,6 +43,8 @@ ACCOUNTS_READ_SCOPE = "dav:accounts:read"
 ACCOUNTS_WRITE_SCOPE = "dav:accounts:write"
 ACCOUNT_GRANTS_READ_SCOPE = "dav:account-grants:read"
 ACCOUNT_GRANTS_WRITE_SCOPE = "dav:account-grants:write"
+TENANT_ACCOUNTS_READ_SCOPE = "dav:tenant-accounts:read"
+TENANT_ACCOUNTS_WRITE_SCOPE = "dav:tenant-accounts:write"
 GRANTS_READ_SCOPE = "dav:grants:read"
 GRANTS_WRITE_SCOPE = "dav:grants:write"
 
@@ -216,6 +218,17 @@ class AccountCreateInput(BaseModel):
     base_url: str = Field(min_length=1, max_length=2048)
     auth: PasswordAuthInput
     enabled: bool = True
+
+
+class InitialAccountAccessInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=200)
+    permission: str = Field(pattern="^(read|read_write)$")
+
+
+class TenantAccountCreateInput(AccountCreateInput):
+    initial_access: InitialAccountAccessInput | None = None
 
 
 class AccountPatchInput(BaseModel):
@@ -721,6 +734,173 @@ def create_gateway_app(
             raise GatewayAPIError(404, "not_found", "Resource grant was not found.")
         return Response(status_code=204)
 
+    @app.get("/v1/tenant/accounts")
+    async def list_tenant_accounts(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        require_scope(identity, TENANT_ACCOUNTS_READ_SCOPE)
+        if limit < 1 or limit > 100:
+            raise GatewayAPIError(422, "invalid_request", "Limit must be between 1 and 100.")
+        accounts = await run_in_threadpool(
+            store.list_tenant_accounts, identity.tenant_id, limit=limit
+        )
+        return {
+            "accounts": [_account_response(account) for account in accounts],
+            "next_cursor": None,
+        }
+
+    @app.post("/v1/tenant/accounts", status_code=201)
+    async def create_tenant_account(
+        payload: TenantAccountCreateInput,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+        idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    ) -> dict[str, Any]:
+        require_scope(identity, TENANT_ACCOUNTS_WRITE_SCOPE)
+        if idempotency_key is not None and not 1 <= len(idempotency_key) <= 200:
+            raise GatewayAPIError(422, "invalid_request", "Idempotency-Key is invalid.")
+        base_url = await _validate_url(url_policy, payload.base_url)
+        credential = _credential(payload.auth)
+        candidate = _candidate_tenant_account(
+            identity.tenant_id,
+            payload.kind,
+            payload.label,
+            base_url,
+            credential,
+            payload.enabled,
+        )
+        calendar_count = await _test_account(connector, candidate)
+        request_payload = payload.model_dump(mode="json")
+        request_payload["auth"]["password"] = payload.auth.password.get_secret_value()
+        initial_access = (
+            (payload.initial_access.user_id, payload.initial_access.permission)
+            if payload.initial_access is not None
+            else None
+        )
+        try:
+            account, _created = await run_in_threadpool(
+                store.create_tenant_account,
+                tenant_id=identity.tenant_id,
+                actor_user_id=identity.user_id,
+                kind=payload.kind,
+                label=payload.label,
+                base_url=base_url,
+                credential=credential,
+                enabled=payload.enabled,
+                status="ready" if payload.enabled else "disabled",
+                last_error=None,
+                idempotency_key=idempotency_key,
+                request_hash=store.request_hash(request_payload) if idempotency_key else None,
+                initial_access=initial_access,
+            )
+        except ValueError as exc:
+            raise GatewayAPIError(409, "conflict", "Idempotency key conflicts.") from exc
+        except OverflowError as exc:
+            raise GatewayAPIError(
+                409, "account_limit_reached", "Tenant account limit was reached."
+            ) from exc
+        response = _account_response(account)
+        response["calendar_count"] = calendar_count
+        return response
+
+    @app.get("/v1/tenant/accounts/{account_ref}")
+    async def get_tenant_account(
+        account_ref: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, TENANT_ACCOUNTS_READ_SCOPE)
+        account = await _tenant_owned_account(account_access_policy, identity, account_ref)
+        return _account_response(account)
+
+    @app.patch("/v1/tenant/accounts/{account_ref}")
+    async def patch_tenant_account(
+        account_ref: str,
+        payload: AccountPatchInput,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, TENANT_ACCOUNTS_WRITE_SCOPE)
+        if not payload.model_fields_set:
+            raise GatewayAPIError(422, "invalid_request", "At least one field is required.")
+        current = await _tenant_owned_account(account_access_policy, identity, account_ref)
+        base_url = (
+            await _validate_url(url_policy, payload.base_url)
+            if payload.base_url is not None
+            else current.base_url
+        )
+        credential = _credential(payload.auth) if payload.auth is not None else current.credential
+        enabled = payload.enabled if payload.enabled is not None else current.enabled
+        candidate = replace(
+            current,
+            label=payload.label if payload.label is not None else current.label,
+            base_url=base_url,
+            credential=credential,
+            enabled=enabled,
+            status="ready" if enabled else "disabled",
+            last_error=None,
+        )
+        if enabled and (payload.base_url is not None or payload.auth is not None):
+            await _test_account(connector, candidate)
+            candidate = replace(candidate, last_checked_at=_now())
+        try:
+            updated = await run_in_threadpool(
+                store.update_tenant_account,
+                candidate,
+                actor_user_id=identity.user_id,
+                audit_operation="tenant_account.update",
+            )
+        except LookupError as exc:
+            raise GatewayAPIError(404, "not_found", "Account was not found.") from exc
+        return _account_response(updated)
+
+    @app.post("/v1/tenant/accounts/{account_ref}/test")
+    async def test_tenant_account(
+        account_ref: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, TENANT_ACCOUNTS_WRITE_SCOPE)
+        account = await _tenant_owned_account(account_access_policy, identity, account_ref)
+        try:
+            calendar_count = await _test_account(connector, account)
+        except GatewayAPIError as exc:
+            checked_at = _now()
+            await run_in_threadpool(
+                store.update_tenant_account,
+                replace(
+                    account,
+                    status="error",
+                    last_checked_at=checked_at,
+                    last_error=exc.code,
+                ),
+                actor_user_id=identity.user_id,
+                audit_operation="tenant_account.test",
+            )
+            raise
+        checked_at = _now()
+        await run_in_threadpool(
+            store.update_tenant_account,
+            replace(account, status="ready", last_checked_at=checked_at, last_error=None),
+            actor_user_id=identity.user_id,
+            audit_operation="tenant_account.test",
+        )
+        return {"status": "ready", "calendar_count": calendar_count, "checked_at": checked_at}
+
+    @app.delete("/v1/tenant/accounts/{account_ref}", status_code=204)
+    async def delete_tenant_account(
+        account_ref: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> Response:
+        require_scope(identity, TENANT_ACCOUNTS_WRITE_SCOPE)
+        await _tenant_owned_account(account_access_policy, identity, account_ref)
+        deleted = await run_in_threadpool(
+            store.delete_tenant_account,
+            identity.tenant_id,
+            account_ref,
+            actor_user_id=identity.user_id,
+        )
+        if not deleted:
+            raise GatewayAPIError(404, "not_found", "Account was not found.")
+        return Response(status_code=204)
+
     @app.get("/v1/tenant/accounts/{account_ref}/grants")
     async def list_account_grants(
         account_ref: str,
@@ -1001,6 +1181,33 @@ def _credential(auth: PasswordAuthInput) -> PasswordCredential:
         username=auth.username,
         password=auth.password.get_secret_value(),
         mode=auth.mode,
+    )
+
+
+def _candidate_tenant_account(
+    tenant_id: str,
+    kind: str,
+    label: str,
+    base_url: str,
+    credential: PasswordCredential,
+    enabled: bool,
+) -> GatewayAccount:
+    now = _now()
+    return GatewayAccount(
+        account_ref="pending",
+        tenant_id=tenant_id,
+        owner_type="tenant",
+        owner_user_id=None,
+        kind=kind,
+        label=label,
+        base_url=base_url,
+        credential=credential,
+        status="ready" if enabled else "disabled",
+        enabled=enabled,
+        last_checked_at=now,
+        last_error=None,
+        created_at=now,
+        updated_at=now,
     )
 
 

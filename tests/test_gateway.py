@@ -49,12 +49,7 @@ from private_dav_mcp.gateway_mcp import (
     _encode_calendar_reference,
 )
 from private_dav_mcp.gateway_references import DurableReferenceCache
-from private_dav_mcp.gateway_store import (
-    AccountCipher,
-    AccountStore,
-    GatewayAccount,
-    PasswordCredential,
-)
+from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 from private_dav_mcp.mcp_sdk import SDK_MCP_PROTOCOL_VERSION, MCPToolCallFailure
 from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
@@ -234,35 +229,6 @@ def _token(
 
 def _headers(private_pem: str, **claims: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {_token(private_pem, **claims)}"}
-
-
-def _insert_gateway_tenant_account(db_path: Path, account_ref: str = "acct_team") -> str:
-    store = AccountStore(
-        db_path,
-        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
-    )
-    account = GatewayAccount(
-        account_ref=account_ref,
-        tenant_id="tenant-a",
-        owner_type="tenant",
-        owner_user_id=None,
-        kind="caldav",
-        label="Private tenant calendar",
-        base_url="https://dav.example/private-tenant/",
-        credential=PasswordCredential(
-            username="tenant-user", password="tenant-secret", mode="basic"
-        ),
-        status="ready",
-        enabled=True,
-        last_checked_at=None,
-        last_error=None,
-        created_at="2026-08-10T00:00:00Z",
-        updated_at="2026-08-10T00:00:00Z",
-    )
-    with store._connect() as connection:  # noqa: SLF001 - gateway integration fixture
-        store._insert_account(connection, account)  # noqa: SLF001 - gateway integration fixture
-        connection.commit()
-    return account_ref
 
 
 def _account_payload(*, password: str = "secret-canary") -> dict[str, Any]:
@@ -782,8 +748,14 @@ def test_resource_grant_api_is_tenant_scoped(
 def test_tenant_account_grant_api_is_scoped_audited_and_non_sensitive(
     gateway: tuple[TestClient, str, FakeConnector, Path],
 ) -> None:
-    client, private_pem, _connector, db_path = gateway
-    account_ref = _insert_gateway_tenant_account(db_path)
+    client, private_pem, _connector, _db_path = gateway
+    tenant_account = client.post(
+        "/v1/tenant/accounts",
+        headers=_headers(private_pem, scopes="dav:tenant-accounts:write"),
+        json=_account_payload(),
+    )
+    assert tenant_account.status_code == 201, tenant_account.text
+    account_ref = tenant_account.json()["account_ref"]
     read_headers = _headers(private_pem, scopes="dav:account-grants:read")
     write_headers = _headers(private_pem, scopes="dav:account-grants:write")
     admin_headers = _headers(
@@ -818,9 +790,9 @@ def test_tenant_account_grant_api_is_scoped_audited_and_non_sensitive(
         "created_at": created.json()["created_at"],
         "updated_at": created.json()["updated_at"],
     }
-    assert "Private tenant calendar" not in created.text
+    assert "Private calendar canary" not in created.text
     assert "https://" not in created.text
-    assert "tenant-secret" not in created.text
+    assert "secret-canary" not in created.text
 
     rejected_tenant = client.put(
         grant_url,
@@ -858,7 +830,7 @@ def test_tenant_account_grant_api_is_scoped_audited_and_non_sensitive(
     listed = client.get(grant_url, headers=read_headers)
     assert listed.status_code == 200
     assert [grant["user_id"] for grant in listed.json()["grants"]] == ["*", "user-b"]
-    assert "Private tenant calendar" not in listed.text
+    assert "Private calendar canary" not in listed.text
 
     other_tenant = client.get(
         grant_url,
@@ -913,7 +885,7 @@ def test_tenant_account_grant_api_is_scoped_audited_and_non_sensitive(
         "account_grant.create",
     ]
     assert all(entry["tenant_id"] == "tenant-a" for entry in second_audit_page.json()["entries"])
-    assert "Private tenant calendar" not in second_audit_page.text
+    assert "Private calendar canary" not in second_audit_page.text
     assert client.get(
         "/v1/tenant/account-grant-audit",
         headers=_headers(
@@ -922,6 +894,161 @@ def test_tenant_account_grant_api_is_scoped_audited_and_non_sensitive(
             scopes="dav:account-grants:read",
         ),
     ).json() == {"entries": [], "next_cursor": None}
+
+
+def test_tenant_account_lifecycle_is_scoped_idempotent_and_atomic(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, connector, db_path = gateway
+    read_headers = _headers(private_pem, scopes="dav:tenant-accounts:read")
+    write_headers = _headers(private_pem, scopes="dav:tenant-accounts:write")
+    admin_b_headers = _headers(
+        private_pem,
+        user_id="admin-b",
+        scopes="dav:tenant-accounts:read dav:tenant-accounts:write",
+    )
+    payload = _account_payload(password="tenant-lifecycle-secret")
+    payload["label"] = "Tenant lifecycle canary"
+    payload["initial_access"] = {"user_id": "user-b", "permission": "read_write"}
+
+    assert client.get("/v1/tenant/accounts", headers=write_headers).status_code == 403
+    assert client.post("/v1/tenant/accounts", headers=read_headers, json=payload).status_code == 403
+    rejected_owner = client.post(
+        "/v1/tenant/accounts",
+        headers=write_headers,
+        json={**payload, "tenant_id": "tenant-b"},
+    )
+    assert rejected_owner.status_code == 422
+
+    created = client.post(
+        "/v1/tenant/accounts",
+        headers={**write_headers, "Idempotency-Key": "create-tenant-lifecycle"},
+        json=payload,
+    )
+    assert created.status_code == 201, created.text
+    account_ref = created.json()["account_ref"]
+    assert created.json()["owner_type"] == "tenant"
+    assert created.json()["calendar_count"] == 2
+    assert "tenant-lifecycle-secret" not in created.text
+
+    retried = client.post(
+        "/v1/tenant/accounts",
+        headers={**admin_b_headers, "Idempotency-Key": "create-tenant-lifecycle"},
+        json=payload,
+    )
+    assert retried.status_code == 201
+    assert retried.json()["account_ref"] == account_ref
+    conflict_payload = dict(payload)
+    conflict_payload["label"] = "Different tenant label"
+    conflict = client.post(
+        "/v1/tenant/accounts",
+        headers={**write_headers, "Idempotency-Key": "create-tenant-lifecycle"},
+        json=conflict_payload,
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "conflict"
+
+    listed = client.get("/v1/tenant/accounts", headers=read_headers)
+    assert listed.status_code == 200
+    assert account_ref in {account["account_ref"] for account in listed.json()["accounts"]}
+    assert all(account["owner_type"] == "tenant" for account in listed.json()["accounts"])
+    assert client.get(
+        "/v1/tenant/accounts",
+        headers=_headers(
+            private_pem,
+            tenant_id="tenant-b",
+            scopes="dav:tenant-accounts:read",
+        ),
+    ).json() == {"accounts": [], "next_cursor": None}
+
+    selected = client.get(f"/v1/tenant/accounts/{account_ref}", headers=read_headers)
+    assert selected.status_code == 200
+    assert selected.json()["label"] == "Tenant lifecycle canary"
+    assert (
+        client.get(
+            f"/v1/tenant/accounts/{account_ref}",
+            headers=_headers(
+                private_pem,
+                tenant_id="tenant-b",
+                scopes="dav:tenant-accounts:read",
+            ),
+        ).status_code
+        == 404
+    )
+
+    initial_grants = client.get(
+        f"/v1/tenant/accounts/{account_ref}/grants",
+        headers=_headers(private_pem, scopes="dav:account-grants:read"),
+    )
+    assert initial_grants.status_code == 200
+    assert [
+        (grant["user_id"], grant["permission"], grant["updated_by"])
+        for grant in initial_grants.json()["grants"]
+    ] == [("user-b", "read_write", "user-a")]
+
+    renamed = client.patch(
+        f"/v1/tenant/accounts/{account_ref}",
+        headers=admin_b_headers,
+        json={"label": "Renamed tenant calendar"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["label"] == "Renamed tenant calendar"
+
+    failed_rotation = client.patch(
+        f"/v1/tenant/accounts/{account_ref}",
+        headers=admin_b_headers,
+        json={
+            "auth": {
+                "type": "password",
+                "username": "tenant-user",
+                "password": "bad-password",
+                "mode": "basic",
+            }
+        },
+    )
+    assert failed_rotation.status_code == 422
+    assert failed_rotation.json()["error"]["code"] == "authentication_failed"
+    tested = client.post(f"/v1/tenant/accounts/{account_ref}/test", headers=admin_b_headers)
+    assert tested.status_code == 200
+    assert connector.calls[-1].credential.password == "tenant-lifecycle-secret"
+
+    deleted = client.delete(f"/v1/tenant/accounts/{account_ref}", headers=write_headers)
+    assert deleted.status_code == 204
+    assert client.get(f"/v1/tenant/accounts/{account_ref}", headers=read_headers).status_code == 404
+    assert (
+        client.get(
+            f"/v1/tenant/accounts/{account_ref}/grants",
+            headers=_headers(private_pem, scopes="dav:account-grants:read"),
+        ).status_code
+        == 404
+    )
+
+    store = AccountStore(
+        db_path,
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    lifecycle_audit = [
+        entry
+        for entry in store.list_tenant_account_audit("tenant-a", limit=100)
+        if entry.account_ref == account_ref
+    ]
+    assert [entry.operation for entry in lifecycle_audit] == [
+        "tenant_account.delete",
+        "tenant_account.test",
+        "tenant_account.update",
+        "tenant_account.create",
+    ]
+    assert [entry.actor_user_id for entry in lifecycle_audit] == [
+        "user-a",
+        "admin-b",
+        "admin-b",
+        "user-a",
+    ]
+    for database_file in db_path.parent.glob("gateway.db*"):
+        content = database_file.read_bytes()
+        assert b"tenant-lifecycle-secret" not in content
+        assert b"Tenant lifecycle canary" not in content
+        assert b"Renamed tenant calendar" not in content
 
 
 def test_resource_grants_support_tenant_and_user_permissions(tmp_path: Path) -> None:
