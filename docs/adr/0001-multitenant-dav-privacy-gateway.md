@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-30
+- **Amended:** 2026-08-10 to separate personal ownership from tenant-owned account grants
 - **Decision owners:** Private DAV MCP and Minigent maintainers
 
 ## Context
@@ -56,24 +57,47 @@ the application identity token itself. Network location is not an identity contr
 
 ### Authorization model
 
-Every durable record and transient reference is owned by `(tenant_id, user_id)`. Database queries
-must include both owner fields. An account, calendar, or event reference issued to one owner is
-invalid for every other owner, even if the underlying DAV URL is identical.
+Every durable account belongs to exactly one tenant and has one of two ownership modes:
+
+- a **user-owned account** belongs to `(tenant_id, owner_user_id)` and is accessible only to that
+  user; or
+- a **tenant-owned account** belongs to `tenant_id` and is accessible only through an explicit
+  account grant to one user or to the reserved `*` tenant-wide subject.
+
+Ownership and access are separate. Tenant ownership MUST NOT be represented by a wildcard owner ID,
+and account grants MUST NOT cross tenants. Every transient calendar, event, or contact reference is
+bound to the requesting `(tenant_id, user_id)`, account, account revision, and reference type. A
+reference issued to one caller is invalid for every other caller, including another user authorized
+to use the same tenant-owned account.
 
 Scopes are additive and initially include:
 
 - `dav:accounts:read`
 - `dav:accounts:write`
+- `dav:tenant-accounts:read`
+- `dav:tenant-accounts:write`
+- `dav:account-grants:read`
+- `dav:account-grants:write`
 - `dav:calendar:read`
 - `dav:calendar:write`
 
-REST account mutation requires `dav:accounts:write`. MCP event reads and free/busy require
-`dav:calendar:read`; event mutation requires `dav:calendar:write`. Minigent remains responsible for
-user confirmation and exact-call approval before invoking model-requested event mutations.
+The existing account scopes govern only the caller's user-owned accounts. Tenant-account scopes
+govern tenant-owned credential lifecycle, and account-grant scopes govern which tenant users may
+use those accounts. Grant permissions are initially `read` and `read_write`; credential and grant
+management are administrative token capabilities rather than grant permissions.
+
+REST account mutation requires the corresponding personal or tenant administrative scope. MCP
+event reads and free/busy require `dav:calendar:read` plus read access to the selected account;
+event mutation requires `dav:calendar:write` plus `read_write` account access. Administrative
+scopes do not imply calendar access. Minigent remains responsible for user confirmation and
+exact-call approval before invoking model-requested event mutations. Administrative scopes MUST
+NOT be included in normal model-facing tool identities.
 
 ### Account vault
 
-Account records are persisted in a relational database. Secret fields are envelope-encrypted:
+Account records are persisted in a relational database and always belong to exactly one tenant.
+User-owned and tenant-owned records use explicit ownership metadata; tenant ownership is never
+encoded as `user_id = "*"`. Secret fields are envelope-encrypted:
 
 - each account receives a random data-encryption key (DEK);
 - account credentials and private labels are encrypted with authenticated encryption;
@@ -92,19 +116,22 @@ part of the first implementation.
 ### References
 
 `account_ref` is a stable, random public identifier for account management. `calendar_ref` and
-`event_ref` are high-entropy opaque tokens stored by hash in a reference table with owner,
-account, resource locator, ETag, type, issuance time, and expiry. Reference lookup requires the
-verified owner tuple and expected type.
+`event_ref` are high-entropy opaque tokens stored by hash in a reference table with requesting
+tenant and user, account, resource locator, ETag, type, issuance time, and expiry. Reference lookup
+requires the verified requesting identity, expected account revision, and expected type.
 
 References are never credentials and are never authorization on their own. They must not expose
-upstream URLs or database keys. Unknown, expired, cross-owner, cross-account, and wrong-type
-references fail with the same non-enumerating error. Event mutations retain ETag preconditions.
+upstream URLs or database keys. Unknown, expired, cross-caller, cross-account, and wrong-type
+references fail with the same non-enumerating error. Users sharing a tenant-owned account receive
+independent caller-bound references. Event mutations retain ETag preconditions.
 
 ### Interface split
 
 The REST API owns actions that should not be selected by a model:
 
-- add, test, update, disable, and remove accounts;
+- add, test, update, disable, and remove a caller's user-owned accounts;
+- administer tenant-owned accounts under separate tenant-account scopes;
+- grant or revoke tenant users' access to tenant-owned accounts;
 - submit or rotate credentials;
 - inspect non-sensitive connection state;
 - enable or disable discovered calendars.
@@ -123,11 +150,17 @@ model-visible structured content.
 
 ### Multi-account behavior
 
-`free_busy` may target explicit authorized calendar references or, when omitted, all enabled
-calendars owned by the caller. The gateway queries accounts concurrently with per-account and
-overall deadlines, merges intervals, and returns only UTC intervals. A partial upstream failure is
-reported as a non-sensitive count/status; it must not identify an account to the model by its
-private label.
+A caller may access multiple personal accounts and multiple explicitly granted tenant-owned
+accounts. `free_busy` may target explicit authorized calendar references or, when omitted, all
+enabled calendars accessible to the caller. The gateway queries accounts concurrently with
+per-account and overall deadlines, merges intervals, and returns only UTC intervals. A partial
+upstream failure is reported as a non-sensitive count/status; it must not identify an account to the
+model by its private label.
+
+Account access composes with MCP scopes: `read` permits calendar reads, while `read_write` also
+permits mutations when the caller has `dav:calendar:write`. Administrative tenant-account or grant
+scopes never imply DAV data access. Users sharing one tenant-owned account receive separate
+caller-bound reference namespaces.
 
 Event mutations always target exactly one account through an account-bound calendar or event
 reference. There is no cross-account write fan-out.
@@ -164,20 +197,27 @@ migration. The gateway uses a new API contract and does not silently change the 
 
 Migration proceeds in stages:
 
-1. add token verification, database migrations, the encrypted vault, and account REST endpoints;
+1. add token verification, database migrations, the encrypted vault, and personal-account REST
+   endpoints;
 2. add a gateway MCP endpoint using account-backed CalDAV adapters;
 3. add Minigent per-user token issuance and migrate calendar traffic;
-4. import the existing static CalDAV account through an administrative migration path;
-5. remove the static calendar sidecar only after contract and production parity;
-6. migrate CardDAV separately.
+4. add explicit account ownership metadata without changing existing personal-account behavior;
+5. add tenant-owned account grants and tenant administrative REST endpoints;
+6. include granted tenant accounts in MCP with caller-bound references and composed scope/grant
+   authorization;
+7. converge existing static CalDAV resources through an explicit administrative migration path;
+8. remove the static calendar sidecar only after contract and production parity;
+9. migrate CardDAV separately.
 
 ## Consequences
 
 ### Benefits
 
-- Users can add accounts without deployment changes.
+- Users can add personal accounts without deployment changes.
+- Tenant administrators can add shared accounts and explicitly grant access without exposing
+  credentials to users or models.
 - One authorization model covers REST and MCP.
-- Credentials and references are strongly tenant- and user-scoped.
+- Credentials are tenant-bound, and references are strongly tenant-, caller-, and account-scoped.
 - Multi-account free/busy becomes a first-class privacy-preserving operation.
 - CardDAV can later reuse the vault and identity foundation.
 
@@ -206,6 +246,18 @@ spoofable. Credentials are never MCP arguments.
 
 A shared token authenticates Minigent but not the end user. Model- or client-supplied owner IDs
 create a confused-deputy risk and are rejected.
+
+### Wildcard user ID as tenant account ownership
+
+Representing a shared account as owned by `user_id = "*"` conflates ownership with authorization,
+complicates encryption context and audit attribution, and encourages accidental tenant-wide access.
+Tenant-owned accounts use explicit ownership metadata and separate grants instead.
+
+### Account `manage` grants
+
+A `manage` grant would mix DAV data permissions with credential and authorization administration.
+Tenant-account lifecycle and account-grant administration therefore require separate trusted token
+scopes; account grants are limited to `read` and `read_write`.
 
 ### Synchronize all calendar content locally in the first release
 
