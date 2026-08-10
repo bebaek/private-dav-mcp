@@ -22,6 +22,7 @@ from starlette.concurrency import run_in_threadpool
 from uvicorn.config import LOGGING_CONFIG
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
+from private_dav_mcp.gateway_access import AccountAccessPolicy
 from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
 from private_dav_mcp.gateway_mcp import (
@@ -436,6 +437,7 @@ def create_gateway_app(
     contacts_mcp: GatewayContactsMCP | None = None,
     settings: GatewaySettings | None = None,
     resource_catalog: tuple[DAVResource, ...] | None = None,
+    account_access_policy: AccountAccessPolicy | None = None,
 ) -> FastAPI:
     if verifier is None or store is None:
         settings = settings or GatewaySettings.from_env()
@@ -457,6 +459,7 @@ def create_gateway_app(
         )
     connector = connector or CalDAVAccountConnector()
     url_policy = url_policy or OutboundURLPolicy()
+    account_access_policy = account_access_policy or AccountAccessPolicy(store)
     static_accounts = settings.static_accounts if settings is not None else ()
     static_contact_account = settings.static_contact_account if settings is not None else None
     require_resource_grants = settings.require_resource_grants if settings is not None else False
@@ -474,6 +477,7 @@ def create_gateway_app(
         store,
         static_accounts=static_accounts,
         require_resource_grants=require_resource_grants,
+        access_policy=account_access_policy,
     )
     contacts_mcp = contacts_mcp or GatewayContactsMCP(
         static_contact_account,
@@ -716,7 +720,9 @@ def create_gateway_app(
         if limit < 1 or limit > 100:
             raise GatewayAPIError(422, "invalid_request", "Limit must be between 1 and 100.")
         accounts = await run_in_threadpool(
-            store.list_accounts, identity.tenant_id, identity.user_id, limit=limit
+            account_access_policy.list_personal_accounts,
+            identity,
+            limit=limit,
         )
         return {
             "accounts": [_account_response(account) for account in accounts],
@@ -771,7 +777,7 @@ def create_gateway_app(
         identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
     ) -> dict[str, Any]:
         require_scope(identity, ACCOUNTS_READ_SCOPE)
-        account = await _owned_account(store, identity, account_ref)
+        account = await _owned_account(account_access_policy, identity, account_ref)
         return _account_response(account)
 
     @app.patch("/v1/accounts/{account_ref}")
@@ -783,7 +789,7 @@ def create_gateway_app(
         require_scope(identity, ACCOUNTS_WRITE_SCOPE)
         if not payload.model_fields_set:
             raise GatewayAPIError(422, "invalid_request", "At least one field is required.")
-        current = await _owned_account(store, identity, account_ref)
+        current = await _owned_account(account_access_policy, identity, account_ref)
         base_url = (
             await _validate_url(url_policy, payload.base_url)
             if payload.base_url is not None
@@ -814,7 +820,7 @@ def create_gateway_app(
         identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
     ) -> dict[str, Any]:
         require_scope(identity, ACCOUNTS_WRITE_SCOPE)
-        account = await _owned_account(store, identity, account_ref)
+        account = await _owned_account(account_access_policy, identity, account_ref)
         try:
             calendar_count = await _test_account(connector, account)
         except GatewayAPIError as exc:
@@ -844,6 +850,7 @@ def create_gateway_app(
         identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
     ) -> Response:
         require_scope(identity, ACCOUNTS_WRITE_SCOPE)
+        await _owned_account(account_access_policy, identity, account_ref)
         deleted = await run_in_threadpool(
             store.delete_account, identity.tenant_id, identity.user_id, account_ref
         )
@@ -855,11 +862,9 @@ def create_gateway_app(
 
 
 async def _owned_account(
-    store: AccountStore, identity: GatewayIdentity, account_ref: str
+    access_policy: AccountAccessPolicy, identity: GatewayIdentity, account_ref: str
 ) -> GatewayAccount:
-    account = await run_in_threadpool(
-        store.get_account, identity.tenant_id, identity.user_id, account_ref
-    )
+    account = await run_in_threadpool(access_policy.get_personal_account, identity, account_ref)
     if account is None:
         raise GatewayAPIError(404, "not_found", "Account was not found.")
     return account

@@ -29,6 +29,7 @@ from private_dav_mcp.caldav import (
     EventResource,
     PrivateCalendarMCPServer,
 )
+from private_dav_mcp.gateway_access import AccountAccessPolicy
 from private_dav_mcp.gateway_identity import GatewayIdentity
 from private_dav_mcp.gateway_references import DurableReferenceCache
 from private_dav_mcp.gateway_store import AccountStore, GatewayAccount, PasswordCredential
@@ -240,8 +241,10 @@ class GatewayCalendarMCP:
         server_factory: Callable[[GatewayAccount], PrivateCalendarMCPServer] | None = None,
         static_accounts: tuple[StaticGatewayAccount, ...] = (),
         require_resource_grants: bool = False,
+        access_policy: AccountAccessPolicy | None = None,
     ) -> None:
         self._store = store
+        self._access_policy = access_policy or AccountAccessPolicy(store)
         self._static_accounts = static_accounts
         self._require_resource_grants = require_resource_grants
         self._server_factory = server_factory
@@ -472,13 +475,9 @@ class GatewayCalendarMCP:
             if (account := self._static_account_for_identity(template, identity, "read"))
             is not None
         ]
-        dynamic_accounts = [
-            account
-            for account in self._store.list_accounts(
-                identity.tenant_id, identity.user_id, limit=100
-            )
-            if account.enabled
-        ]
+        dynamic_accounts = self._access_policy.list_personal_accounts(
+            identity, limit=100, enabled_only=True
+        )
         static_refs = {account.account_ref for account in static_accounts}
         return static_accounts + [
             account for account in dynamic_accounts if account.account_ref not in static_refs
@@ -509,8 +508,10 @@ class GatewayCalendarMCP:
             static_account = self._static_account_for_identity(template, identity, permission)
             if static_account is not None and static_account.account_ref == account_ref:
                 return static_account
-        account = self._store.get_account(identity.tenant_id, identity.user_id, account_ref)
-        if account is None or not account.enabled:
+        account = self._access_policy.get_personal_account(
+            identity, account_ref, require_enabled=True
+        )
+        if account is None:
             raise PermissionError("Unknown or unavailable account reference")
         return account
 
