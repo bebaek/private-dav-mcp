@@ -58,6 +58,17 @@ class GatewayAccount:
 
 
 @dataclass(frozen=True)
+class TenantAccountAudit:
+    audit_id: int
+    tenant_id: str
+    account_ref: str
+    actor_user_id: str
+    operation: str
+    outcome: str
+    created_at: str
+
+
+@dataclass(frozen=True)
 class AccountGrant:
     account_ref: str
     tenant_id: str
@@ -207,12 +218,14 @@ class AccountStore:
         *,
         cipher: AccountCipher,
         max_accounts_per_user: int = 10,
+        max_accounts_per_tenant: int = 50,
     ) -> None:
-        if max_accounts_per_user < 1:
+        if max_accounts_per_user < 1 or max_accounts_per_tenant < 1:
             raise ValueError("Account limit must be positive")
         self._path = str(path)
         self._cipher = cipher
         self._max_accounts_per_user = max_accounts_per_user
+        self._max_accounts_per_tenant = max_accounts_per_tenant
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._migrate()
         os.chmod(self._path, 0o600)
@@ -297,6 +310,165 @@ class AccountStore:
             connection.commit()
         return account, True
 
+    def create_tenant_account(
+        self,
+        *,
+        tenant_id: str,
+        actor_user_id: str,
+        kind: str,
+        label: str,
+        base_url: str,
+        credential: PasswordCredential,
+        enabled: bool,
+        status: str,
+        last_error: str | None,
+        idempotency_key: str | None,
+        request_hash: str | None,
+        initial_access: tuple[str, str] | None = None,
+    ) -> tuple[GatewayAccount, bool]:
+        if not tenant_id or not actor_user_id:
+            raise ValueError("Tenant account identifiers are required")
+        if idempotency_key is not None and request_hash is None:
+            raise ValueError("Tenant account idempotency requires a request hash")
+        if initial_access is not None:
+            initial_user_id, initial_permission = initial_access
+            if not initial_user_id or initial_permission not in {"read", "read_write"}:
+                raise ValueError("Initial account access is invalid")
+        now = _utc_now()
+        account_ref = f"acct_{secrets.token_urlsafe(24)}"
+        account = GatewayAccount(
+            account_ref=account_ref,
+            tenant_id=tenant_id,
+            owner_type="tenant",
+            owner_user_id=None,
+            kind=kind,
+            label=label,
+            base_url=base_url,
+            credential=credential,
+            status=status,
+            enabled=enabled,
+            last_checked_at=now,
+            last_error=last_error,
+            created_at=now,
+            updated_at=now,
+        )
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if idempotency_key is not None:
+                existing = connection.execute(
+                    """
+                    SELECT request_hash, account_ref FROM tenant_account_idempotency
+                    WHERE tenant_id = ? AND idempotency_key = ?
+                    """,
+                    (tenant_id, idempotency_key),
+                ).fetchone()
+                if existing is not None:
+                    if existing["request_hash"] != request_hash:
+                        raise ValueError("Idempotency key was already used for another request")
+                    stored = self._get_account_for_tenant(
+                        connection, tenant_id, str(existing["account_ref"])
+                    )
+                    if stored is None or stored.owner_type != "tenant":
+                        raise RuntimeError("Idempotent tenant account result is unavailable")
+                    connection.commit()
+                    return stored, False
+            account_count = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM dav_accounts
+                    WHERE tenant_id = ? AND owner_type = 'tenant'
+                    """,
+                    (tenant_id,),
+                ).fetchone()[0]
+            )
+            if account_count >= self._max_accounts_per_tenant:
+                raise OverflowError("Tenant account limit reached")
+            self._insert_account(connection, account)
+            if idempotency_key is not None:
+                connection.execute(
+                    """
+                    INSERT INTO tenant_account_idempotency
+                      (tenant_id, idempotency_key, request_hash, account_ref, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (tenant_id, idempotency_key, request_hash, account_ref, now),
+                )
+            if initial_access is not None:
+                initial_user_id, initial_permission = initial_access
+                connection.execute(
+                    """
+                    INSERT INTO dav_account_grants (
+                      account_ref, tenant_id, user_id, permission, enabled,
+                      updated_by, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                    """,
+                    (
+                        account_ref,
+                        tenant_id,
+                        initial_user_id,
+                        initial_permission,
+                        actor_user_id,
+                        now,
+                        now,
+                    ),
+                )
+                resulting = connection.execute(
+                    """
+                    SELECT * FROM dav_account_grants
+                    WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
+                    """,
+                    (account_ref, tenant_id, initial_user_id),
+                ).fetchone()
+                if resulting is None:  # pragma: no cover - defensive
+                    raise RuntimeError("Initial account grant was not saved")
+                self._audit_account_grant(
+                    connection,
+                    account_ref=account_ref,
+                    tenant_id=tenant_id,
+                    user_id=initial_user_id,
+                    actor_id=actor_user_id,
+                    operation="account_grant.create",
+                    previous=None,
+                    resulting=resulting,
+                    created_at=now,
+                )
+            self._audit_tenant_account(
+                connection,
+                account,
+                actor_user_id=actor_user_id,
+                operation="tenant_account.create",
+                outcome="success",
+            )
+            connection.commit()
+        return account, True
+
+    def list_tenant_accounts(self, tenant_id: str, *, limit: int) -> list[GatewayAccount]:
+        if limit < 1:
+            raise ValueError("Tenant account limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM dav_accounts
+                WHERE tenant_id = ? AND owner_type = 'tenant'
+                ORDER BY created_at, account_ref LIMIT ?
+                """,
+                (tenant_id, limit),
+            ).fetchall()
+        return [self._decode_account(row) for row in rows]
+
+    def list_tenant_account_audit(self, tenant_id: str, *, limit: int) -> list[TenantAccountAudit]:
+        if limit < 1:
+            raise ValueError("Tenant account audit limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM tenant_account_audit
+                WHERE tenant_id = ? ORDER BY id DESC LIMIT ?
+                """,
+                (tenant_id, limit),
+            ).fetchall()
+        return [_tenant_account_audit_from_row(row) for row in rows]
+
     def list_accounts(self, tenant_id: str, user_id: str, *, limit: int) -> list[GatewayAccount]:
         with self._connect() as connection:
             rows = connection.execute(
@@ -315,14 +487,7 @@ class AccountStore:
 
     def get_account_for_tenant(self, tenant_id: str, account_ref: str) -> GatewayAccount | None:
         with self._connect() as connection:
-            row = connection.execute(
-                """
-                SELECT * FROM dav_accounts
-                WHERE tenant_id = ? AND account_ref = ?
-                """,
-                (tenant_id, account_ref),
-            ).fetchone()
-        return self._decode_account(row) if row is not None else None
+            return self._get_account_for_tenant(connection, tenant_id, account_ref)
 
     def list_accounts_for_subject(
         self,
@@ -453,6 +618,95 @@ class AccountStore:
             connection.commit()
             return True
 
+    def update_tenant_account(
+        self,
+        account: GatewayAccount,
+        *,
+        actor_user_id: str,
+        audit_operation: str,
+    ) -> GatewayAccount:
+        if account.owner_type != "tenant" or account.owner_user_id is not None:
+            raise ValueError("Tenant account ownership is required")
+        if not actor_user_id:
+            raise ValueError("Tenant account actor is required")
+        updated = replace(account, updated_at=_utc_now())
+        encrypted = self._encrypt_account(updated)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE dav_accounts SET
+                  label_cipher = ?, base_url_cipher = ?, auth_cipher = ?, wrapped_dek = ?,
+                  key_version = ?, aad_version = ?, auth_type = ?, auth_mode = ?, status = ?,
+                  enabled = ?, last_checked_at = ?, last_error = ?, updated_at = ?
+                WHERE account_ref = ? AND tenant_id = ? AND owner_type = 'tenant'
+                """,
+                (
+                    encrypted["label_cipher"],
+                    encrypted["base_url_cipher"],
+                    encrypted["auth_cipher"],
+                    encrypted["wrapped_dek"],
+                    encrypted["key_version"],
+                    encrypted["aad_version"],
+                    "password",
+                    updated.credential.mode,
+                    updated.status,
+                    int(updated.enabled),
+                    updated.last_checked_at,
+                    updated.last_error,
+                    updated.updated_at,
+                    updated.account_ref,
+                    updated.tenant_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LookupError("Tenant account not found")
+            connection.execute(
+                "DELETE FROM dav_references WHERE tenant_id = ? AND account_ref = ?",
+                (updated.tenant_id, updated.account_ref),
+            )
+            self._audit_tenant_account(
+                connection,
+                updated,
+                actor_user_id=actor_user_id,
+                operation=audit_operation,
+                outcome="success",
+            )
+            connection.commit()
+        return updated
+
+    def delete_tenant_account(
+        self, tenant_id: str, account_ref: str, *, actor_user_id: str
+    ) -> bool:
+        if not actor_user_id:
+            raise ValueError("Tenant account actor is required")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            account = self._get_account_for_tenant(connection, tenant_id, account_ref)
+            if account is None or account.owner_type != "tenant":
+                connection.rollback()
+                return False
+            self._audit_tenant_account(
+                connection,
+                account,
+                actor_user_id=actor_user_id,
+                operation="tenant_account.delete",
+                outcome="success",
+            )
+            connection.execute(
+                "DELETE FROM dav_references WHERE tenant_id = ? AND account_ref = ?",
+                (tenant_id, account_ref),
+            )
+            connection.execute(
+                """
+                DELETE FROM dav_accounts
+                WHERE account_ref = ? AND tenant_id = ? AND owner_type = 'tenant'
+                """,
+                (account_ref, tenant_id),
+            )
+            connection.commit()
+            return True
+
     def _insert_account(self, connection: sqlite3.Connection, account: GatewayAccount) -> None:
         encrypted = self._encrypt_account(account)
         connection.execute(
@@ -486,6 +740,18 @@ class AccountStore:
                 account.updated_at,
             ),
         )
+
+    def _get_account_for_tenant(
+        self, connection: sqlite3.Connection, tenant_id: str, account_ref: str
+    ) -> GatewayAccount | None:
+        row = connection.execute(
+            """
+            SELECT * FROM dav_accounts
+            WHERE tenant_id = ? AND account_ref = ?
+            """,
+            (tenant_id, account_ref),
+        ).fetchone()
+        return self._decode_account(row) if row is not None else None
 
     def _get_account(
         self, connection: sqlite3.Connection, tenant_id: str, user_id: str, account_ref: str
@@ -1124,6 +1390,31 @@ class AccountStore:
         )
 
     @staticmethod
+    def _audit_tenant_account(
+        connection: sqlite3.Connection,
+        account: GatewayAccount,
+        *,
+        actor_user_id: str,
+        operation: str,
+        outcome: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO tenant_account_audit
+              (tenant_id, account_ref, actor_user_id, operation, outcome, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account.tenant_id,
+                account.account_ref,
+                actor_user_id,
+                operation,
+                outcome,
+                _utc_now(),
+            ),
+        )
+
+    @staticmethod
     def _audit_account_grant(
         connection: sqlite3.Connection,
         *,
@@ -1265,6 +1556,15 @@ class AccountStore:
                   PRIMARY KEY (tenant_id, user_id, idempotency_key)
                 );
 
+                CREATE TABLE IF NOT EXISTS tenant_account_idempotency (
+                  tenant_id TEXT NOT NULL,
+                  idempotency_key TEXT NOT NULL,
+                  request_hash TEXT NOT NULL,
+                  account_ref TEXT NOT NULL REFERENCES dav_accounts(account_ref) ON DELETE CASCADE,
+                  created_at TEXT NOT NULL,
+                  PRIMARY KEY (tenant_id, idempotency_key)
+                );
+
                 CREATE TABLE IF NOT EXISTS dav_account_grants (
                   account_ref TEXT NOT NULL,
                   tenant_id TEXT NOT NULL,
@@ -1378,6 +1678,28 @@ class AccountStore:
                     SELECT RAISE(ABORT, 'resource grant audit is append-only');
                   END;
 
+                CREATE TABLE IF NOT EXISTS tenant_account_audit (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  tenant_id TEXT NOT NULL,
+                  account_ref TEXT NOT NULL,
+                  actor_user_id TEXT NOT NULL,
+                  operation TEXT NOT NULL,
+                  outcome TEXT NOT NULL,
+                  created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS tenant_account_audit_tenant
+                  ON tenant_account_audit (tenant_id, id DESC);
+                CREATE TRIGGER IF NOT EXISTS tenant_account_audit_no_update
+                  BEFORE UPDATE ON tenant_account_audit
+                  BEGIN
+                    SELECT RAISE(ABORT, 'tenant account audit is append-only');
+                  END;
+                CREATE TRIGGER IF NOT EXISTS tenant_account_audit_no_delete
+                  BEFORE DELETE ON tenant_account_audit
+                  BEGIN
+                    SELECT RAISE(ABORT, 'tenant account audit is append-only');
+                  END;
+
                 CREATE TABLE IF NOT EXISTS gateway_audit (
                   id INTEGER PRIMARY KEY AUTOINCREMENT,
                   tenant_id TEXT NOT NULL,
@@ -1387,7 +1709,7 @@ class AccountStore:
                   outcome TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 5;
+                PRAGMA user_version = 6;
                 """
             )
             account_columns = {
@@ -1444,7 +1766,19 @@ class AccountStore:
                       ON dav_references (tenant_id, user_id, account_ref, reference_type);
                     """
                 )
-            connection.execute("PRAGMA user_version = 5")
+            connection.execute("PRAGMA user_version = 6")
+
+
+def _tenant_account_audit_from_row(row: sqlite3.Row) -> TenantAccountAudit:
+    return TenantAccountAudit(
+        audit_id=int(row["id"]),
+        tenant_id=str(row["tenant_id"]),
+        account_ref=str(row["account_ref"]),
+        actor_user_id=str(row["actor_user_id"]),
+        operation=str(row["operation"]),
+        outcome=str(row["outcome"]),
+        created_at=str(row["created_at"]),
+    )
 
 
 def _account_grant_from_row(row: sqlite3.Row) -> AccountGrant:

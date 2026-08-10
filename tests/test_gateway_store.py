@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -150,7 +151,7 @@ def test_v4_account_migration_backfills_ownership_without_reencrypting(tmp_path:
             """
         ).fetchone()
         assert row == ("user", "user-a", 1, original_wrapped_dek)
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
         tables = {
             item[0]
             for item in connection.execute(
@@ -209,6 +210,100 @@ def test_new_account_ciphertext_is_bound_to_explicit_ownership(tmp_path: Path) -
 
     with pytest.raises(InvalidTag):
         store.get_account("tenant-a", "user-a", account.account_ref)
+
+
+def test_tenant_account_lifecycle_is_idempotent_atomic_and_audited(tmp_path: Path) -> None:
+    database = tmp_path / "tenant-lifecycle.db"
+    store = AccountStore(database, cipher=_cipher(), max_accounts_per_tenant=1)
+    create_kwargs = {
+        "tenant_id": "tenant-a",
+        "kind": "caldav",
+        "label": "Team calendar",
+        "base_url": "https://dav.example/team/",
+        "credential": PasswordCredential(
+            username="team-user", password="team-secret", mode="basic"
+        ),
+        "enabled": True,
+        "status": "ready",
+        "last_error": None,
+        "idempotency_key": "create-team",
+        "request_hash": "request-hash",
+        "initial_access": ("*", "read"),
+    }
+
+    account, created = store.create_tenant_account(
+        actor_user_id="admin-a",
+        **create_kwargs,
+    )
+    assert created is True
+    assert account.owner_type == "tenant"
+    assert account.owner_user_id is None
+    grants = store.list_account_grants(account.account_ref, "tenant-a")
+    assert [(grant.user_id, grant.permission) for grant in grants] == [("*", "read")]
+    assert grants[0].updated_by == "admin-a"
+
+    retried, retried_created = store.create_tenant_account(
+        actor_user_id="admin-b",
+        **create_kwargs,
+    )
+    assert retried_created is False
+    assert retried.account_ref == account.account_ref
+    assert len(store.list_tenant_accounts("tenant-a", limit=10)) == 1
+    assert store.list_tenant_accounts("tenant-b", limit=10) == []
+
+    with pytest.raises(ValueError, match="Idempotency key"):
+        store.create_tenant_account(
+            actor_user_id="admin-b",
+            **{**create_kwargs, "request_hash": "different-hash"},
+        )
+    with pytest.raises(OverflowError, match="Tenant account limit"):
+        store.create_tenant_account(
+            actor_user_id="admin-a",
+            **{
+                **create_kwargs,
+                "idempotency_key": None,
+                "request_hash": None,
+                "initial_access": None,
+            },
+        )
+
+    store.put_reference(
+        reference="event-reference",
+        tenant_id="tenant-a",
+        user_id="user-a",
+        account_ref=account.account_ref,
+        account_updated_at=account.updated_at,
+        reference_type="event",
+        payload=b"{}",
+        expires_at=time.time() + 60,
+    )
+    updated = store.update_tenant_account(
+        replace(account, label="Renamed team calendar"),
+        actor_user_id="admin-b",
+        audit_operation="tenant_account.update",
+    )
+    assert updated.label == "Renamed team calendar"
+    assert store.list_references("tenant-a", "user-a", account.account_ref) == []
+
+    assert store.delete_tenant_account("tenant-a", account.account_ref, actor_user_id="admin-a")
+    assert store.get_account_for_tenant("tenant-a", account.account_ref) is None
+    assert store.list_account_grants(account.account_ref, "tenant-a") == []
+    assert [entry.operation for entry in store.list_tenant_account_audit("tenant-a", limit=10)] == [
+        "tenant_account.delete",
+        "tenant_account.update",
+        "tenant_account.create",
+    ]
+    assert [
+        entry.actor_user_id for entry in store.list_tenant_account_audit("tenant-a", limit=10)
+    ] == ["admin-a", "admin-b", "admin-a"]
+    grant_audit = store.list_account_grant_audit("tenant-a", limit=10)
+    assert [entry.operation for entry in grant_audit] == ["account_grant.create"]
+    with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM tenant_account_idempotency").fetchone()[0] == 0
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute("DELETE FROM tenant_account_audit")
 
 
 def _insert_tenant_account(store: AccountStore, account_ref: str, tenant_id: str) -> GatewayAccount:

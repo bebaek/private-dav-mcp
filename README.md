@@ -187,12 +187,33 @@ Safe migration order:
    healthy. Keep credentials in the deployment secret until a separate credential-onboarding
    migration is implemented.
 
+### Tenant-managed CalDAV accounts
+
+Tenant administrators can onboard shared CalDAV credentials through `POST /v1/tenant/accounts`
+using `dav:tenant-accounts:write`. Tenant account ownership comes only from the verified token; the
+request rejects `tenant_id`, `owner_type`, and owner-user fields. `GET /v1/tenant/accounts` and the
+per-account GET route require `dav:tenant-accounts:read`; update, test, disable, credential rotation,
+and deletion require `dav:tenant-accounts:write`.
+
+Creation accepts an optional `initial_access` object with a user ID (or explicit `*`) and `read` or
+`read_write`. The encrypted account, initial grant, account audit, and grant audit commit atomically
+after DAV discovery succeeds. An `Idempotency-Key` is scoped to the tenant, allowing a different
+authorized administrator to retry without creating a duplicate. Administrative scopes do not grant
+calendar access by themselves. Subsequent access is managed through the account-grant routes and
+`dav:account-grants:read` / `dav:account-grants:write`.
+
 Implemented interfaces:
 
 - `GET /v1/resources`
 - `GET/PUT /v1/resource-grants`
 - `DELETE /v1/resource-grants/{resource_id}?user_id=...`
 - `GET /v1/resource-grant-audit?limit=...&before_id=...`
+- `GET/POST /v1/tenant/accounts`
+- `GET/PATCH/DELETE /v1/tenant/accounts/{account_ref}`
+- `POST /v1/tenant/accounts/{account_ref}/test`
+- `GET/PUT /v1/tenant/accounts/{account_ref}/grants`
+- `DELETE /v1/tenant/accounts/{account_ref}/grants/{user_id}`
+- `GET /v1/tenant/account-grant-audit?limit=...&before_id=...`
 - `GET/POST /v1/accounts`
 - `GET/PATCH/DELETE /v1/accounts/{account_ref}`
 - `POST /v1/accounts/{account_ref}/test`
@@ -205,10 +226,11 @@ Implemented interfaces:
 Credential fields submitted through the management API are write-only and account labels, URLs,
 usernames, and passwords are encrypted at rest with a per-account DEK wrapped by the active
 deployment KEK. Environment-configured accounts remain in the environment and bypass database
-onboarding. Resource grants contain no DAV credentials and dynamically authorize static sources by
-tenant and user. Every account and MCP request is scoped to the tenant and user from the verified
-bearer token. Contact, calendar, and event references are encrypted at rest in SQLite; only a
-SHA-256 hash of the opaque token is indexed. References are bound to tenant, user, account, account
+onboarding. Static resource grants contain no DAV credentials and dynamically authorize static
+sources by tenant and user. Personal accounts are bound to the tenant and user from the verified
+bearer token; tenant-owned accounts are bound to the verified tenant and require an explicit account
+grant for DAV access. Contact, calendar, and event references are encrypted at rest in SQLite; only
+a SHA-256 hash of the opaque token is indexed. References are bound to tenant, user, account, account
 revision, and resource type, expire after their normal TTL, resolve across gateway instances, and
 are invalidated by account or environment configuration updates. This permits replicas that share
 the same gateway SQLite database; deployments must still ensure the underlying volume and all other
