@@ -1522,6 +1522,7 @@ class AccountStore:
 
     def _migrate(self) -> None:
         with self._connect() as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
             connection.executescript(
                 """
                 PRAGMA journal_mode = WAL;
@@ -1533,7 +1534,7 @@ class AccountStore:
                     CHECK (owner_type IN ('user', 'tenant')),
                   owner_user_id TEXT,
                   aad_version INTEGER NOT NULL DEFAULT 1 CHECK (aad_version IN (1, 2)),
-                  kind TEXT NOT NULL CHECK (kind = 'caldav'),
+                  kind TEXT NOT NULL CHECK (kind IN ('caldav', 'carddav')),
                   label_cipher BLOB NOT NULL,
                   base_url_cipher BLOB NOT NULL,
                   auth_cipher BLOB NOT NULL,
@@ -1716,9 +1717,90 @@ class AccountStore:
                   outcome TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 6;
+                PRAGMA user_version = 7;
                 """
             )
+            pre_migration_columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(dav_accounts)")
+            }
+            if "owner_type" not in pre_migration_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE dav_accounts ADD COLUMN owner_type TEXT NOT NULL DEFAULT 'user'
+                    CHECK (owner_type IN ('user', 'tenant'))
+                    """
+                )
+            if "owner_user_id" not in pre_migration_columns:
+                connection.execute("ALTER TABLE dav_accounts ADD COLUMN owner_user_id TEXT")
+            if "aad_version" not in pre_migration_columns:
+                connection.execute(
+                    """
+                    ALTER TABLE dav_accounts ADD COLUMN aad_version INTEGER NOT NULL DEFAULT 1
+                    CHECK (aad_version IN (1, 2))
+                    """
+                )
+            connection.execute(
+                """
+                UPDATE dav_accounts SET owner_user_id = user_id
+                WHERE owner_type = 'user' AND owner_user_id IS NULL
+                """
+            )
+            account_schema = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'dav_accounts'"
+            ).fetchone()
+            if account_schema is not None and "kind = 'caldav'" in str(account_schema["sql"]):
+                connection.executescript(
+                    """
+                    PRAGMA legacy_alter_table = ON;
+                    DROP INDEX IF EXISTS dav_accounts_owner;
+                    DROP INDEX IF EXISTS dav_accounts_tenant_ref;
+                    DROP INDEX IF EXISTS dav_accounts_ownership;
+                    ALTER TABLE dav_accounts RENAME TO dav_accounts_v6;
+                    CREATE TABLE dav_accounts (
+                      account_ref TEXT PRIMARY KEY,
+                      tenant_id TEXT NOT NULL,
+                      user_id TEXT NOT NULL,
+                      owner_type TEXT NOT NULL DEFAULT 'user'
+                        CHECK (owner_type IN ('user', 'tenant')),
+                      owner_user_id TEXT,
+                      aad_version INTEGER NOT NULL DEFAULT 1 CHECK (aad_version IN (1, 2)),
+                      kind TEXT NOT NULL CHECK (kind IN ('caldav', 'carddav')),
+                      label_cipher BLOB NOT NULL,
+                      base_url_cipher BLOB NOT NULL,
+                      auth_cipher BLOB NOT NULL,
+                      wrapped_dek BLOB NOT NULL,
+                      key_version INTEGER NOT NULL,
+                      auth_type TEXT NOT NULL CHECK (auth_type = 'password'),
+                      auth_mode TEXT NOT NULL,
+                      status TEXT NOT NULL,
+                      enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                      last_checked_at TEXT,
+                      last_error TEXT,
+                      created_at TEXT NOT NULL,
+                      updated_at TEXT NOT NULL
+                    );
+                    INSERT INTO dav_accounts (
+                      account_ref, tenant_id, user_id, owner_type, owner_user_id, aad_version, kind,
+                      label_cipher, base_url_cipher, auth_cipher, wrapped_dek, key_version,
+                      auth_type, auth_mode, status, enabled, last_checked_at, last_error,
+                      created_at, updated_at
+                    )
+                    SELECT
+                      account_ref, tenant_id, user_id, owner_type, owner_user_id, aad_version, kind,
+                      label_cipher, base_url_cipher, auth_cipher, wrapped_dek, key_version,
+                      auth_type, auth_mode, status, enabled, last_checked_at, last_error,
+                      created_at, updated_at
+                    FROM dav_accounts_v6;
+                    DROP TABLE dav_accounts_v6;
+                    CREATE INDEX dav_accounts_owner
+                      ON dav_accounts (tenant_id, user_id, created_at);
+                    CREATE UNIQUE INDEX dav_accounts_tenant_ref
+                      ON dav_accounts (account_ref, tenant_id);
+                    CREATE INDEX dav_accounts_ownership
+                      ON dav_accounts (tenant_id, owner_type, owner_user_id, created_at);
+                    PRAGMA legacy_alter_table = OFF;
+                    """
+                )
             account_columns = {
                 str(row[1]) for row in connection.execute("PRAGMA table_info(dav_accounts)")
             }
@@ -1773,7 +1855,11 @@ class AccountStore:
                       ON dav_references (tenant_id, user_id, account_ref, reference_type);
                     """
                 )
-            connection.execute("PRAGMA user_version = 6")
+            connection.execute("PRAGMA user_version = 7")
+            violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError("Account database foreign key migration failed")
+            connection.execute("PRAGMA foreign_keys = ON")
 
 
 def _tenant_account_audit_from_row(row: sqlite3.Row) -> TenantAccountAudit:

@@ -480,6 +480,7 @@ class GatewayCalendarMCP:
             for accessible in self._access_policy.list_accessible(
                 identity, permission="read", limit=100
             )
+            if accessible.account.kind == "caldav"
         ]
         static_refs = {account.account_ref for account in static_accounts}
         return static_accounts + [
@@ -516,7 +517,7 @@ class GatewayCalendarMCP:
             if static_account is not None and static_account.account_ref == account_ref:
                 return static_account
         accessible = self._access_policy.resolve(identity, account_ref, permission=permission)
-        if accessible is None:
+        if accessible is None or accessible.account.kind != "caldav":
             raise PermissionError("Unknown or unavailable account reference")
         return accessible.account
 
