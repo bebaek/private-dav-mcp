@@ -151,7 +151,7 @@ def test_v4_account_migration_backfills_ownership_without_reencrypting(tmp_path:
             """
         ).fetchone()
         assert row == ("user", "user-a", 1, original_wrapped_dek)
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
         tables = {
             item[0]
             for item in connection.execute(

@@ -249,6 +249,9 @@ tenant-owned account MUST delete its grants and invalidate all outstanding refer
 }
 ```
 
+`kind` is `caldav` or `carddav`. A CardDAV account uses its address-book collection URL as
+`base_url`; its remaining encrypted management representation is identical.
+
 `status` is one of `pending`, `ready`, `error`, or `disabled`. `last_error`, when present, is a
 stable non-sensitive code such as `authentication_failed`, `connection_failed`,
 `tls_validation_failed`, `url_not_allowed`, or `dav_discovery_failed`. It MUST NOT contain an
@@ -302,8 +305,11 @@ Password-account request:
 }
 ```
 
-The gateway validates outbound URL policy, encrypts the account, performs principal and calendar
-home discovery, and returns `201` with the account representation. A failed connection test returns
+The `kind` field accepts `caldav` and `carddav`. For CardDAV, `base_url` is the address-book URL.
+The gateway validates outbound URL policy, encrypts the account, performs the protocol-appropriate
+CalDAV or CardDAV discovery check, and returns `201` with the account representation. A successful
+CalDAV create returns `calendar_count`; a successful CardDAV create returns `addressbook_count`.
+A failed connection test returns
 a non-sensitive `422` and MUST NOT persist the account. Repeating a request with the same owner and
 `Idempotency-Key` returns the original result and MUST NOT create another account.
 
@@ -373,8 +379,9 @@ Response:
 }
 ```
 
-The route performs a live DAV discovery check. Failures use stable error codes and do not expose
-private calendar names or upstream response bodies.
+For CardDAV accounts, the response contains `addressbook_count` instead of `calendar_count`.
+The route performs a live protocol-appropriate DAV discovery check. Failures use stable error codes
+and do not expose private collection names or upstream response bodies.
 
 ### Delete an account
 
@@ -684,7 +691,8 @@ The initial gateway implementation accepts one secret-backed static CardDAV acco
 independent encrypted opaque-reference namespace for each authenticated tenant/user. References
 persist in the shared gateway SQLite store and resolve across gateway processes. Cross-caller,
 unconfigured-caller, and unknown contact references return non-enumerating errors. The endpoint
-preserves private-value envelopes and ETag mutation behavior. API-managed CardDAV account onboarding
+preserves private-value envelopes and ETag mutation behavior. API-managed CardDAV account lifecycle
+is available through the personal and tenant account routes, but account-backed CardDAV MCP routing
 is outside this compatibility milestone.
 
 ## Errors

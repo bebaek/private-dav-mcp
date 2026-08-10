@@ -32,6 +32,7 @@ from private_dav_mcp.caldav import (
 from private_dav_mcp.carddav import CachedContact, Contact, PrivateContactsMCPServer
 from private_dav_mcp.gateway import (
     AccountConnectionError,
+    DAVAccountConnector,
     DAVResource,
     GatewaySettings,
     HealthcheckAccessLogFilter,
@@ -117,6 +118,60 @@ def test_uvicorn_log_config_installs_healthcheck_filter() -> None:
     }
     assert json_log_config["formatters"]["access"] == {
         "()": "private_dav_mcp.gateway.JSONLogFormatter"
+    }
+
+
+def test_dav_account_connector_dispatches_carddav_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, str] = {}
+
+    class ReadyCardDAVSource:
+        def __init__(
+            self,
+            *,
+            addressbook_url: str,
+            username: str,
+            password: str,
+            auth_mode: str,
+        ) -> None:
+            observed.update(
+                url=addressbook_url,
+                username=username,
+                password=password,
+                mode=auth_mode,
+            )
+
+        def check_ready(self) -> None:
+            observed["ready"] = "yes"
+
+    monkeypatch.setattr("private_dav_mcp.gateway.CardDAVContactSource", ReadyCardDAVSource)
+    account = GatewayAccount(
+        account_ref="acct_carddav",
+        tenant_id="tenant-a",
+        owner_type="user",
+        owner_user_id="user-a",
+        kind="carddav",
+        label="Address book",
+        base_url="https://dav.example/addressbooks/personal/",
+        credential=PasswordCredential(
+            username="contact-user", password="contact-secret", mode="digest"
+        ),
+        status="ready",
+        enabled=True,
+        last_checked_at=None,
+        last_error=None,
+        created_at="2026-08-10T00:00:00Z",
+        updated_at="2026-08-10T00:00:00Z",
+    )
+
+    assert DAVAccountConnector().test(account) == 1
+    assert observed == {
+        "url": "https://dav.example/addressbooks/personal/",
+        "username": "contact-user",
+        "password": "contact-secret",
+        "mode": "digest",
+        "ready": "yes",
     }
 
 
@@ -354,6 +409,79 @@ def test_account_lifecycle_is_owner_scoped_and_credentials_are_write_only(
     deleted = client.delete(f"/v1/accounts/{account_ref}", headers=owner_headers)
     assert deleted.status_code == 204
     assert client.get(f"/v1/accounts/{account_ref}", headers=owner_headers).status_code == 404
+
+
+def test_carddav_personal_and_tenant_account_lifecycle(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, connector, db_path = gateway
+    personal_headers = _headers(
+        private_pem,
+        scopes="dav:accounts:read dav:accounts:write dav:calendar:read",
+    )
+    payload = _account_payload(password="carddav-personal-secret")
+    payload.update(
+        {
+            "kind": "carddav",
+            "label": "Personal address book",
+            "base_url": "https://dav.example/addressbooks/personal/",
+        }
+    )
+    created = client.post("/v1/accounts", headers=personal_headers, json=payload)
+    assert created.status_code == 201, created.text
+    assert created.json()["kind"] == "carddav"
+    assert created.json()["addressbook_count"] == 2
+    assert "calendar_count" not in created.json()
+    personal_ref = created.json()["account_ref"]
+    assert connector.calls[-1].kind == "carddav"
+
+    tested = client.post(f"/v1/accounts/{personal_ref}/test", headers=personal_headers)
+    assert tested.status_code == 200
+    assert tested.json()["addressbook_count"] == 2
+    calendar_accounts = _mcp(
+        client,
+        personal_headers,
+        "tools/call",
+        {"name": "calendar_accounts_list", "arguments": {}},
+    )["result"]["structuredContent"]["accounts"]
+    assert personal_ref not in {account["account_ref"] for account in calendar_accounts}
+
+    tenant_headers = _headers(
+        private_pem,
+        scopes="dav:tenant-accounts:read dav:tenant-accounts:write",
+    )
+    tenant_payload = _account_payload(password="carddav-tenant-secret")
+    tenant_payload.update(
+        {
+            "kind": "carddav",
+            "label": "Shared address book",
+            "base_url": "https://dav.example/addressbooks/shared/",
+            "initial_access": {"user_id": "user-a", "permission": "read_write"},
+        }
+    )
+    tenant_created = client.post("/v1/tenant/accounts", headers=tenant_headers, json=tenant_payload)
+    assert tenant_created.status_code == 201, tenant_created.text
+    assert tenant_created.json()["kind"] == "carddav"
+    assert tenant_created.json()["addressbook_count"] == 2
+    tenant_ref = tenant_created.json()["account_ref"]
+    tenant_tested = client.post(f"/v1/tenant/accounts/{tenant_ref}/test", headers=tenant_headers)
+    assert tenant_tested.status_code == 200
+    assert tenant_tested.json()["addressbook_count"] == 2
+
+    assert b"carddav-personal-secret" not in db_path.read_bytes()
+    assert b"carddav-tenant-secret" not in db_path.read_bytes()
+    invalid = _account_payload()
+    invalid["kind"] = "webdav"
+    rejected = client.post("/v1/accounts", headers=personal_headers, json=invalid)
+    assert rejected.status_code == 422
+
+    assert (
+        client.delete(f"/v1/accounts/{personal_ref}", headers=personal_headers).status_code == 204
+    )
+    assert (
+        client.delete(f"/v1/tenant/accounts/{tenant_ref}", headers=tenant_headers).status_code
+        == 204
+    )
 
 
 def _mcp(

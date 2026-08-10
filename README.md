@@ -34,11 +34,11 @@ privacy gateway with a management API and MCP interface. See
 [ADR 0001](docs/adr/0001-multitenant-dav-privacy-gateway.md) and the draft
 [gateway contract v1](docs/gateway-contract-v1.md). The gateway now includes identity-token
 verification, an encrypted SQLite account vault, outbound URL policy, owner-scoped account
-lifecycle endpoints, an authenticated multi-account calendar MCP endpoint, and an authenticated
-static CardDAV compatibility endpoint, plus encrypted owner/account-bound SQLite references that
-survive gateway process replacement and resolve across replicas. Calendar preference routes and
-API-managed CardDAV accounts remain planned; standalone sidecar executables remain available for
-compatibility.
+lifecycle endpoints for CalDAV and CardDAV accounts, an authenticated multi-account calendar MCP
+endpoint, and an authenticated static CardDAV compatibility endpoint, plus encrypted
+owner/account-bound SQLite references that survive gateway process replacement and resolve across
+replicas. Calendar preference routes and account-backed CardDAV MCP routing remain planned;
+standalone sidecar executables remain available for compatibility.
 
 To run that suite locally:
 
@@ -187,9 +187,10 @@ Safe migration order:
    healthy. Keep credentials in the deployment secret until a separate credential-onboarding
    migration is implemented.
 
-### Tenant-managed CalDAV accounts
+### Tenant-managed DAV accounts
 
-Tenant administrators can onboard shared CalDAV credentials through `POST /v1/tenant/accounts`
+Tenant administrators can onboard shared CalDAV or CardDAV credentials through
+`POST /v1/tenant/accounts`
 using `dav:tenant-accounts:write`. Tenant account ownership comes only from the verified token; the
 request rejects `tenant_id`, `owner_type`, and owner-user fields. `GET /v1/tenant/accounts` and the
 per-account GET route require `dav:tenant-accounts:read`; update, test, disable, credential rotation,
@@ -245,11 +246,15 @@ Implemented interfaces:
 - `GET /health/live`
 - `GET /health/ready`
 
-Credential fields submitted through the management API are write-only and account labels, URLs,
-usernames, and passwords are encrypted at rest with a per-account DEK wrapped by the active
-deployment KEK. Environment-configured accounts remain in the environment and bypass database
-onboarding. Static resource grants contain no DAV credentials and dynamically authorize static
-sources by tenant and user. Personal accounts are bound to the tenant and user from the verified
+Credential fields submitted through the management API are write-only. Both personal and
+tenant-owned account routes accept `kind: "caldav"` and `kind: "carddav"`; successful CardDAV
+connection tests return `addressbook_count` instead of `calendar_count`. Account-backed CardDAV MCP
+routing remains a separate migration slice, so `/contacts/mcp` continues to use only its configured
+static compatibility account in this release. Account labels, URLs, usernames, and passwords are
+encrypted at rest with a per-account DEK wrapped by the active deployment KEK.
+Environment-configured accounts remain in the environment and bypass database onboarding. Static
+resource grants contain no DAV credentials and dynamically authorize static sources by tenant and
+user. Personal accounts are bound to the tenant and user from the verified
 bearer token; tenant-owned accounts are bound to the verified tenant and require an explicit account
 grant for DAV access. Contact, calendar, and event references are encrypted at rest in SQLite; only
 a SHA-256 hash of the opaque token is indexed. References are bound to tenant, user, account, account

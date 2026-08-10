@@ -23,6 +23,7 @@ from starlette.concurrency import run_in_threadpool
 from uvicorn.config import LOGGING_CONFIG
 
 from private_dav_mcp.caldav import CalDAVCalendarSource
+from private_dav_mcp.carddav import CardDAVContactSource
 from private_dav_mcp.gateway_access import AccountAccessPolicy
 from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
 from private_dav_mcp.gateway_identity import GatewayIdentity, IdentityError, IdentityVerifier
@@ -143,6 +144,31 @@ class CalDAVAccountConnector:
             raise AccountConnectionError(code) from exc
 
 
+class DAVAccountConnector:
+    def test(self, account: GatewayAccount) -> int:
+        if account.kind == "caldav":
+            return CalDAVAccountConnector().test(account)
+        if account.kind == "carddav":
+            try:
+                source = CardDAVContactSource(
+                    addressbook_url=account.base_url,
+                    username=account.credential.username,
+                    password=account.credential.password,
+                    auth_mode=account.credential.mode,
+                )
+                source.check_ready()
+                return 1
+            except RuntimeError as exc:
+                message = str(exc).lower()
+                code = (
+                    "authentication_failed"
+                    if "401" in message or "authentication" in message
+                    else "dav_discovery_failed"
+                )
+                raise AccountConnectionError(code) from exc
+        raise AccountConnectionError("unsupported_account_kind")
+
+
 class OutboundURLPolicy:
     def __init__(
         self,
@@ -214,7 +240,7 @@ class ResourceGrantPutInput(BaseModel):
 class AccountCreateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    kind: str = Field(pattern="^caldav$")
+    kind: str = Field(pattern="^(caldav|carddav)$")
     label: str = Field(min_length=1, max_length=100)
     base_url: str = Field(min_length=1, max_length=2048)
     auth: PasswordAuthInput
@@ -481,7 +507,7 @@ def create_gateway_app(
             allowed_networks=settings.allowed_networks,
             allowed_host_suffixes=settings.allowed_host_suffixes,
         )
-    connector = connector or CalDAVAccountConnector()
+    connector = connector or DAVAccountConnector()
     url_policy = url_policy or OutboundURLPolicy()
     account_access_policy = account_access_policy or AccountAccessPolicy(store)
     static_accounts = settings.static_accounts if settings is not None else ()
@@ -872,7 +898,7 @@ def create_gateway_app(
             credential,
             payload.enabled,
         )
-        calendar_count = await _test_account(connector, candidate)
+        collection_count = await _test_account(connector, candidate)
         request_payload = payload.model_dump(mode="json")
         request_payload["auth"]["password"] = payload.auth.password.get_secret_value()
         initial_access = (
@@ -903,7 +929,7 @@ def create_gateway_app(
                 409, "account_limit_reached", "Tenant account limit was reached."
             ) from exc
         response = _account_response(account)
-        response["calendar_count"] = calendar_count
+        response.update(_collection_count(account.kind, collection_count))
         return response
 
     @app.get("/v1/tenant/accounts/{account_ref}")
@@ -963,7 +989,7 @@ def create_gateway_app(
         require_scope(identity, TENANT_ACCOUNTS_WRITE_SCOPE)
         account = await _tenant_owned_account(account_access_policy, identity, account_ref)
         try:
-            calendar_count = await _test_account(connector, account)
+            collection_count = await _test_account(connector, account)
         except GatewayAPIError as exc:
             checked_at = _now()
             await run_in_threadpool(
@@ -985,7 +1011,11 @@ def create_gateway_app(
             actor_user_id=identity.user_id,
             audit_operation="tenant_account.test",
         )
-        return {"status": "ready", "calendar_count": calendar_count, "checked_at": checked_at}
+        return {
+            "status": "ready",
+            **_collection_count(account.kind, collection_count),
+            "checked_at": checked_at,
+        }
 
     @app.delete("/v1/tenant/accounts/{account_ref}", status_code=204)
     async def delete_tenant_account(
@@ -1122,7 +1152,7 @@ def create_gateway_app(
         candidate = _candidate_account(
             identity, payload.kind, payload.label, base_url, credential, payload.enabled
         )
-        calendar_count = await _test_account(connector, candidate)
+        collection_count = await _test_account(connector, candidate)
         request_payload = payload.model_dump(mode="json")
         request_payload["auth"]["password"] = payload.auth.password.get_secret_value()
         try:
@@ -1147,7 +1177,7 @@ def create_gateway_app(
                 409, "account_limit_reached", "Account limit was reached."
             ) from exc
         response = _account_response(account)
-        response["calendar_count"] = calendar_count
+        response.update(_collection_count(account.kind, collection_count))
         return response
 
     @app.get("/v1/accounts/{account_ref}")
@@ -1201,7 +1231,7 @@ def create_gateway_app(
         require_scope(identity, ACCOUNTS_WRITE_SCOPE)
         account = await _owned_account(account_access_policy, identity, account_ref)
         try:
-            calendar_count = await _test_account(connector, account)
+            collection_count = await _test_account(connector, account)
         except GatewayAPIError as exc:
             checked_at = _now()
             await run_in_threadpool(
@@ -1221,7 +1251,11 @@ def create_gateway_app(
             replace(account, status="ready", last_checked_at=checked_at, last_error=None),
             audit_operation="account.test",
         )
-        return {"status": "ready", "calendar_count": calendar_count, "checked_at": checked_at}
+        return {
+            "status": "ready",
+            **_collection_count(account.kind, collection_count),
+            "checked_at": checked_at,
+        }
 
     @app.delete("/v1/accounts/{account_ref}", status_code=204)
     async def delete_account(
@@ -1339,6 +1373,10 @@ def _candidate_account(
         created_at=now,
         updated_at=now,
     )
+
+
+def _collection_count(kind: str, count: int) -> dict[str, int]:
+    return {"addressbook_count" if kind == "carddav" else "calendar_count": count}
 
 
 def _account_response(account: GatewayAccount) -> dict[str, Any]:
