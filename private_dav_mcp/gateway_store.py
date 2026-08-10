@@ -58,6 +58,33 @@ class GatewayAccount:
 
 
 @dataclass(frozen=True)
+class AccountGrant:
+    account_ref: str
+    tenant_id: str
+    user_id: str
+    permission: str
+    enabled: bool
+    updated_by: str
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class AccountGrantAudit:
+    audit_id: int
+    account_ref: str
+    tenant_id: str
+    user_id: str
+    actor_id: str
+    operation: str
+    previous_permission: str | None
+    previous_enabled: bool | None
+    resulting_permission: str | None
+    resulting_enabled: bool | None
+    created_at: str
+
+
+@dataclass(frozen=True)
 class ResourceGrant:
     resource_id: str
     tenant_id: str
@@ -545,6 +572,184 @@ class AccountStore:
             updated_at=row["updated_at"],
         )
 
+    def list_account_grants(self, account_ref: str, tenant_id: str) -> list[AccountGrant]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM dav_account_grants
+                WHERE account_ref = ? AND tenant_id = ?
+                ORDER BY user_id
+                """,
+                (account_ref, tenant_id),
+            ).fetchall()
+        return [_account_grant_from_row(row) for row in rows]
+
+    def list_account_grant_audit(
+        self,
+        tenant_id: str,
+        *,
+        limit: int,
+        before_id: int | None = None,
+    ) -> list[AccountGrantAudit]:
+        if limit < 1:
+            raise ValueError("Account grant audit limit must be positive")
+        if before_id is not None and before_id < 1:
+            raise ValueError("Account grant audit cursor must be positive")
+        query = """
+            SELECT * FROM dav_account_grant_audit
+            WHERE tenant_id = ?
+        """
+        parameters: list[str | int] = [tenant_id]
+        if before_id is not None:
+            query += " AND id < ?"
+            parameters.append(before_id)
+        query += " ORDER BY id DESC LIMIT ?"
+        parameters.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [_account_grant_audit_from_row(row) for row in rows]
+
+    def upsert_account_grant(
+        self,
+        *,
+        account_ref: str,
+        tenant_id: str,
+        user_id: str,
+        permission: str,
+        enabled: bool,
+        updated_by: str,
+    ) -> AccountGrant:
+        if not account_ref or not tenant_id or not user_id or not updated_by:
+            raise ValueError("Account grant identifiers are required")
+        if permission not in {"read", "read_write"}:
+            raise ValueError("Account grant permission must be read or read_write")
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_tenant_account(connection, account_ref, tenant_id)
+            previous = connection.execute(
+                """
+                SELECT * FROM dav_account_grants
+                WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (account_ref, tenant_id, user_id),
+            ).fetchone()
+            if previous is None:
+                grant_count = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*) FROM dav_account_grants
+                        WHERE account_ref = ? AND tenant_id = ?
+                        """,
+                        (account_ref, tenant_id),
+                    ).fetchone()[0]
+                )
+                if grant_count >= 500:
+                    raise OverflowError("Account grant limit reached")
+            connection.execute(
+                """
+                INSERT INTO dav_account_grants (
+                  account_ref, tenant_id, user_id, permission, enabled,
+                  updated_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_ref, tenant_id, user_id) DO UPDATE SET
+                  permission = excluded.permission,
+                  enabled = excluded.enabled,
+                  updated_by = excluded.updated_by,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    account_ref,
+                    tenant_id,
+                    user_id,
+                    permission,
+                    int(enabled),
+                    updated_by,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM dav_account_grants
+                WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (account_ref, tenant_id, user_id),
+            ).fetchone()
+            if row is None:  # pragma: no cover - defensive
+                raise RuntimeError("Account grant was not saved")
+            self._audit_account_grant(
+                connection,
+                account_ref=account_ref,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                actor_id=updated_by,
+                operation=_account_grant_operation(previous, row),
+                previous=previous,
+                resulting=row,
+                created_at=now,
+            )
+            connection.commit()
+        return _account_grant_from_row(row)
+
+    def delete_account_grant(
+        self,
+        account_ref: str,
+        tenant_id: str,
+        user_id: str,
+        *,
+        deleted_by: str,
+    ) -> bool:
+        if not deleted_by:
+            raise ValueError("Account grant actor is required")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._require_tenant_account(connection, account_ref, tenant_id)
+            previous = connection.execute(
+                """
+                SELECT * FROM dav_account_grants
+                WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (account_ref, tenant_id, user_id),
+            ).fetchone()
+            if previous is None:
+                connection.rollback()
+                return False
+            cursor = connection.execute(
+                """
+                DELETE FROM dav_account_grants
+                WHERE account_ref = ? AND tenant_id = ? AND user_id = ?
+                """,
+                (account_ref, tenant_id, user_id),
+            )
+            self._audit_account_grant(
+                connection,
+                account_ref=account_ref,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                actor_id=deleted_by,
+                operation="account_grant.delete",
+                previous=previous,
+                resulting=None,
+                created_at=_utc_now(),
+            )
+            connection.commit()
+        return cursor.rowcount > 0
+
+    @staticmethod
+    def _require_tenant_account(
+        connection: sqlite3.Connection, account_ref: str, tenant_id: str
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT owner_type FROM dav_accounts
+            WHERE account_ref = ? AND tenant_id = ?
+            """,
+            (account_ref, tenant_id),
+        ).fetchone()
+        if row is None or str(row["owner_type"]) != "tenant":
+            raise LookupError("Tenant-owned account not found")
+
     def resource_access(
         self,
         resource_id: str,
@@ -919,6 +1124,41 @@ class AccountStore:
         )
 
     @staticmethod
+    def _audit_account_grant(
+        connection: sqlite3.Connection,
+        *,
+        account_ref: str,
+        tenant_id: str,
+        user_id: str,
+        actor_id: str,
+        operation: str,
+        previous: sqlite3.Row | None,
+        resulting: sqlite3.Row | None,
+        created_at: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO dav_account_grant_audit (
+              account_ref, tenant_id, user_id, actor_id, operation,
+              previous_permission, previous_enabled,
+              resulting_permission, resulting_enabled, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                account_ref,
+                tenant_id,
+                user_id,
+                actor_id,
+                operation,
+                str(previous["permission"]) if previous is not None else None,
+                int(previous["enabled"]) if previous is not None else None,
+                str(resulting["permission"]) if resulting is not None else None,
+                int(resulting["enabled"]) if resulting is not None else None,
+                created_at,
+            ),
+        )
+
+    @staticmethod
     def _audit_resource_grant(
         connection: sqlite3.Connection,
         *,
@@ -1205,6 +1445,57 @@ class AccountStore:
                     """
                 )
             connection.execute("PRAGMA user_version = 5")
+
+
+def _account_grant_from_row(row: sqlite3.Row) -> AccountGrant:
+    return AccountGrant(
+        account_ref=str(row["account_ref"]),
+        tenant_id=str(row["tenant_id"]),
+        user_id=str(row["user_id"]),
+        permission=str(row["permission"]),
+        enabled=bool(row["enabled"]),
+        updated_by=str(row["updated_by"]),
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _account_grant_audit_from_row(row: sqlite3.Row) -> AccountGrantAudit:
+    return AccountGrantAudit(
+        audit_id=int(row["id"]),
+        account_ref=str(row["account_ref"]),
+        tenant_id=str(row["tenant_id"]),
+        user_id=str(row["user_id"]),
+        actor_id=str(row["actor_id"]),
+        operation=str(row["operation"]),
+        previous_permission=(
+            str(row["previous_permission"]) if row["previous_permission"] is not None else None
+        ),
+        previous_enabled=(
+            bool(row["previous_enabled"]) if row["previous_enabled"] is not None else None
+        ),
+        resulting_permission=(
+            str(row["resulting_permission"]) if row["resulting_permission"] is not None else None
+        ),
+        resulting_enabled=(
+            bool(row["resulting_enabled"]) if row["resulting_enabled"] is not None else None
+        ),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _account_grant_operation(previous: sqlite3.Row | None, resulting: sqlite3.Row) -> str:
+    if previous is None:
+        return "account_grant.create"
+    permission_changed = previous["permission"] != resulting["permission"]
+    enabled_changed = bool(previous["enabled"]) != bool(resulting["enabled"])
+    if permission_changed and enabled_changed:
+        return "account_grant.update"
+    if permission_changed:
+        return "account_grant.permission_change"
+    if enabled_changed:
+        return "account_grant.enable" if bool(resulting["enabled"]) else "account_grant.disable"
+    return "account_grant.touch"
 
 
 def _resource_grant_from_row(row: sqlite3.Row) -> ResourceGrant:

@@ -49,7 +49,12 @@ from private_dav_mcp.gateway_mcp import (
     _encode_calendar_reference,
 )
 from private_dav_mcp.gateway_references import DurableReferenceCache
-from private_dav_mcp.gateway_store import AccountCipher, AccountStore, GatewayAccount
+from private_dav_mcp.gateway_store import (
+    AccountCipher,
+    AccountStore,
+    GatewayAccount,
+    PasswordCredential,
+)
 from private_dav_mcp.ics import ICSSubscriptionCalendarSource
 from private_dav_mcp.mcp_sdk import SDK_MCP_PROTOCOL_VERSION, MCPToolCallFailure
 from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
@@ -229,6 +234,35 @@ def _token(
 
 def _headers(private_pem: str, **claims: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {_token(private_pem, **claims)}"}
+
+
+def _insert_gateway_tenant_account(db_path: Path, account_ref: str = "acct_team") -> str:
+    store = AccountStore(
+        db_path,
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    account = GatewayAccount(
+        account_ref=account_ref,
+        tenant_id="tenant-a",
+        owner_type="tenant",
+        owner_user_id=None,
+        kind="caldav",
+        label="Private tenant calendar",
+        base_url="https://dav.example/private-tenant/",
+        credential=PasswordCredential(
+            username="tenant-user", password="tenant-secret", mode="basic"
+        ),
+        status="ready",
+        enabled=True,
+        last_checked_at=None,
+        last_error=None,
+        created_at="2026-08-10T00:00:00Z",
+        updated_at="2026-08-10T00:00:00Z",
+    )
+    with store._connect() as connection:  # noqa: SLF001 - gateway integration fixture
+        store._insert_account(connection, account)  # noqa: SLF001 - gateway integration fixture
+        connection.commit()
+    return account_ref
 
 
 def _account_payload(*, password: str = "secret-canary") -> dict[str, Any]:
@@ -743,6 +777,151 @@ def test_resource_grant_api_is_tenant_scoped(
     )
     assert other_audit.status_code == 200
     assert other_audit.json() == {"entries": [], "next_cursor": None}
+
+
+def test_tenant_account_grant_api_is_scoped_audited_and_non_sensitive(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, db_path = gateway
+    account_ref = _insert_gateway_tenant_account(db_path)
+    read_headers = _headers(private_pem, scopes="dav:account-grants:read")
+    write_headers = _headers(private_pem, scopes="dav:account-grants:write")
+    admin_headers = _headers(
+        private_pem,
+        scopes="dav:account-grants:read dav:account-grants:write",
+    )
+    grant_url = f"/v1/tenant/accounts/{account_ref}/grants"
+
+    assert client.get(grant_url, headers=write_headers).status_code == 403
+    assert (
+        client.put(
+            grant_url,
+            headers=read_headers,
+            json={"user_id": "user-b", "permission": "read", "enabled": True},
+        ).status_code
+        == 403
+    )
+
+    created = client.put(
+        grant_url,
+        headers=admin_headers,
+        json={"user_id": "user-b", "permission": "read", "enabled": True},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json() == {
+        "account_ref": account_ref,
+        "tenant_id": "tenant-a",
+        "user_id": "user-b",
+        "permission": "read",
+        "enabled": True,
+        "updated_by": "user-a",
+        "created_at": created.json()["created_at"],
+        "updated_at": created.json()["updated_at"],
+    }
+    assert "Private tenant calendar" not in created.text
+    assert "https://" not in created.text
+    assert "tenant-secret" not in created.text
+
+    rejected_tenant = client.put(
+        grant_url,
+        headers=admin_headers,
+        json={
+            "tenant_id": "tenant-b",
+            "user_id": "user-b",
+            "permission": "read",
+            "enabled": True,
+        },
+    )
+    assert rejected_tenant.status_code == 422
+
+    updated = client.put(
+        grant_url,
+        headers=admin_headers,
+        json={"user_id": "user-b", "permission": "read_write", "enabled": False},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["permission"] == "read_write"
+    assert updated.json()["enabled"] is False
+    touched = client.put(
+        grant_url,
+        headers=admin_headers,
+        json={"user_id": "user-b", "permission": "read_write", "enabled": False},
+    )
+    assert touched.status_code == 200
+    wildcard = client.put(
+        grant_url,
+        headers=admin_headers,
+        json={"user_id": "*", "permission": "read", "enabled": True},
+    )
+    assert wildcard.status_code == 200
+
+    listed = client.get(grant_url, headers=read_headers)
+    assert listed.status_code == 200
+    assert [grant["user_id"] for grant in listed.json()["grants"]] == ["*", "user-b"]
+    assert "Private tenant calendar" not in listed.text
+
+    other_tenant = client.get(
+        grant_url,
+        headers=_headers(
+            private_pem,
+            tenant_id="tenant-b",
+            scopes="dav:account-grants:read",
+        ),
+    )
+    assert other_tenant.status_code == 404
+
+    personal = client.post(
+        "/v1/accounts",
+        headers=_headers(private_pem, scopes="dav:accounts:write"),
+        json=_account_payload(),
+    )
+    assert personal.status_code == 201
+    personal_grant = client.put(
+        f"/v1/tenant/accounts/{personal.json()['account_ref']}/grants",
+        headers=write_headers,
+        json={"user_id": "user-b", "permission": "read", "enabled": True},
+    )
+    assert personal_grant.status_code == 404
+
+    deleted = client.delete(
+        f"{grant_url}/user-b",
+        headers=write_headers,
+    )
+    assert deleted.status_code == 204
+    assert client.delete(f"{grant_url}/user-b", headers=write_headers).status_code == 404
+
+    first_audit_page = client.get(
+        "/v1/tenant/account-grant-audit",
+        headers=read_headers,
+        params={"limit": 2},
+    )
+    assert first_audit_page.status_code == 200
+    assert first_audit_page.json()["next_cursor"] is not None
+    assert [entry["operation"] for entry in first_audit_page.json()["entries"]] == [
+        "account_grant.delete",
+        "account_grant.create",
+    ]
+    second_audit_page = client.get(
+        "/v1/tenant/account-grant-audit",
+        headers=read_headers,
+        params={"limit": 10, "before_id": first_audit_page.json()["next_cursor"]},
+    )
+    assert second_audit_page.status_code == 200
+    assert [entry["operation"] for entry in second_audit_page.json()["entries"]] == [
+        "account_grant.touch",
+        "account_grant.update",
+        "account_grant.create",
+    ]
+    assert all(entry["tenant_id"] == "tenant-a" for entry in second_audit_page.json()["entries"])
+    assert "Private tenant calendar" not in second_audit_page.text
+    assert client.get(
+        "/v1/tenant/account-grant-audit",
+        headers=_headers(
+            private_pem,
+            tenant_id="tenant-b",
+            scopes="dav:account-grants:read",
+        ),
+    ).json() == {"entries": [], "next_cursor": None}
 
 
 def test_resource_grants_support_tenant_and_user_permissions(tmp_path: Path) -> None:
