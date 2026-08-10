@@ -325,13 +325,21 @@ class AccountStore:
         idempotency_key: str | None,
         request_hash: str | None,
         initial_access: tuple[str, str] | None = None,
+        initial_accesses: tuple[tuple[str, str], ...] = (),
+        audit_operation: str = "tenant_account.create",
     ) -> tuple[GatewayAccount, bool]:
         if not tenant_id or not actor_user_id:
             raise ValueError("Tenant account identifiers are required")
         if idempotency_key is not None and request_hash is None:
             raise ValueError("Tenant account idempotency requires a request hash")
-        if initial_access is not None:
-            initial_user_id, initial_permission = initial_access
+        access_entries = (
+            (initial_access,) if initial_access is not None else ()
+        ) + initial_accesses
+        if len(access_entries) > 500 or len({entry[0] for entry in access_entries}) != len(
+            access_entries
+        ):
+            raise ValueError("Initial account access is invalid")
+        for initial_user_id, initial_permission in access_entries:
             if not initial_user_id or initial_permission not in {"read", "read_write"}:
                 raise ValueError("Initial account access is invalid")
         now = _utc_now()
@@ -393,8 +401,7 @@ class AccountStore:
                     """,
                     (tenant_id, idempotency_key, request_hash, account_ref, now),
                 )
-            if initial_access is not None:
-                initial_user_id, initial_permission = initial_access
+            for initial_user_id, initial_permission in access_entries:
                 connection.execute(
                     """
                     INSERT INTO dav_account_grants (
@@ -436,7 +443,7 @@ class AccountStore:
                 connection,
                 account,
                 actor_user_id=actor_user_id,
-                operation="tenant_account.create",
+                operation=audit_operation,
                 outcome="success",
             )
             connection.commit()

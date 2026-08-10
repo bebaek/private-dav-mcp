@@ -1504,6 +1504,140 @@ def test_gateway_settings_load_static_caldav_account_from_environment(
     assert "environment-secret" not in repr(account)
 
 
+def test_static_caldav_resource_migration_is_scoped_atomic_and_idempotent(
+    tmp_path: Path, signing_keys: tuple[str, str]
+) -> None:
+    private_pem, public_pem = signing_keys
+    db_path = tmp_path / "static-migration.db"
+    store = AccountStore(
+        db_path,
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    verifier = IdentityVerifier(
+        issuer=ISSUER,
+        audience=AUDIENCE,
+        public_keys={"test-key": public_pem},
+        leeway_seconds=0,
+    )
+    connector = FakeConnector()
+    policy = OutboundURLPolicy(resolver=lambda _host: ["93.184.216.34"])
+
+    def client_for(password: str) -> TestClient:
+        static_account = StaticCalendarAccount(
+            account_id="primary",
+            label="Static shared calendar",
+            base_url="https://dav.example/calendars/",
+            username="static-user",
+            password=password,
+            tenant_id="tenant-a",
+            user_id="legacy-user",
+        )
+        settings = GatewaySettings(
+            db_path=str(db_path),
+            jwt_issuer=ISSUER,
+            jwt_audience=AUDIENCE,
+            jwt_public_keys={"test-key": public_pem},
+            encryption_keyring={1: b"k" * 32},
+            active_encryption_key_version=1,
+            allowed_networks=(),
+            allowed_host_suffixes=(),
+            static_accounts=(static_account,),
+            static_contact_account=None,
+            require_resource_grants=True,
+        )
+        return TestClient(
+            create_gateway_app(
+                verifier=verifier,
+                store=store,
+                connector=connector,
+                url_policy=policy,
+                settings=settings,
+                calendar_mcp=GatewayCalendarMCP(
+                    store,
+                    static_accounts=(static_account,),
+                    server_factory=lambda _account: PrivateCalendarMCPServer(
+                        calendars=[Calendar("Shared", "https://dav.example/calendars/shared/")]
+                    ),
+                    require_resource_grants=True,
+                ),
+            )
+        )
+
+    client = client_for("static-secret")
+    resource_admin = _headers(private_pem, scopes="dav:grants:write")
+    for user_id, permission in (("user-a", "read"), ("user-b", "read_write")):
+        response = client.put(
+            "/v1/resource-grants",
+            headers=resource_admin,
+            json={
+                "resource_id": "caldav:primary",
+                "user_id": user_id,
+                "permission": permission,
+                "enabled": True,
+            },
+        )
+        assert response.status_code == 200
+
+    migration_path = "/v1/tenant/static-resources/caldav:primary/migrate"
+    assert (
+        client.post(
+            migration_path,
+            headers=_headers(private_pem, scopes="dav:tenant-accounts:write"),
+        ).status_code
+        == 403
+    )
+    migration_headers = _headers(
+        private_pem,
+        scopes=("dav:tenant-accounts:write dav:account-grants:write dav:grants:read"),
+    )
+    migrated = client.post(migration_path, headers=migration_headers)
+    assert migrated.status_code == 201, migrated.text
+    body = migrated.json()
+    assert body["created"] is True
+    assert body["source_resource_id"] == "caldav:primary"
+    assert body["grant_count"] == 2
+    assert body["calendar_count"] == 2
+    account_ref = body["account"]["account_ref"]
+    assert body["account"]["owner_type"] == "tenant"
+    assert "static-secret" not in migrated.text
+
+    account = store.get_account_for_tenant("tenant-a", account_ref)
+    assert account is not None
+    assert account.credential.password == "static-secret"
+    grants = store.list_account_grants(account_ref, "tenant-a")
+    assert {(grant.user_id, grant.permission) for grant in grants} == {
+        ("user-a", "read"),
+        ("user-b", "read_write"),
+    }
+    assert b"static-secret" not in db_path.read_bytes()
+
+    retried = client.post(migration_path, headers=migration_headers)
+    assert retried.status_code == 200
+    assert retried.json()["created"] is False
+    assert retried.json()["account"]["account_ref"] == account_ref
+    assert len(store.list_tenant_accounts("tenant-a", limit=100)) == 1
+    migration_audit = store.list_tenant_account_audit("tenant-a", limit=100)
+    assert len(migration_audit) == 1
+    assert migration_audit[0].operation == "tenant_account.migrate"
+    assert len(store.list_account_grant_audit("tenant-a", limit=100)) == 2
+
+    cross_tenant = client.post(
+        migration_path,
+        headers=_headers(
+            private_pem,
+            tenant_id="tenant-b",
+            scopes=("dav:tenant-accounts:write dav:account-grants:write dav:grants:read"),
+        ),
+    )
+    assert cross_tenant.status_code == 404
+
+    changed_configuration = client_for("rotated-static-secret")
+    conflict = changed_configuration.post(migration_path, headers=migration_headers)
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "migration_conflict"
+    assert b"rotated-static-secret" not in db_path.read_bytes()
+
+
 def test_static_caldav_accounts_are_owner_scoped_without_database_onboarding(
     tmp_path: Path,
 ) -> None:
