@@ -202,6 +202,13 @@ authorized administrator to retry without creating a duplicate. Administrative s
 calendar access by themselves. Subsequent access is managed through the account-grant routes and
 `dav:account-grants:read` / `dav:account-grants:write`.
 
+The calendar MCP endpoint combines the caller's `dav:calendar:read` or `dav:calendar:write` scope
+with effective account access. `calendar_accounts_list`, `calendars_list`, event reads, and
+`free_busy` include personal accounts plus tenant accounts granted as `read` or `read_write`; event
+mutation additionally requires `read_write`. Users sharing one account receive independent
+caller-bound calendar and event references. Revoking a grant takes effect on the next operation, and
+account updates, disablement, or deletion invalidate outstanding references for every grantee.
+
 Implemented interfaces:
 
 - `GET /v1/resources`

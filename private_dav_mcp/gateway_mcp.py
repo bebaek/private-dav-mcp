@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from mcp.server.lowlevel import Server
 
@@ -43,8 +43,8 @@ from private_dav_mcp.protocol import PRIVATE_VALUES_META_KEY
 CALENDAR_ACCOUNTS_LIST_TOOL = {
     "name": "calendar_accounts_list",
     "description": (
-        "List the authenticated user's enabled calendar accounts with opaque account_ref values "
-        "and protected labels. Never display account_ref values."
+        "List the authenticated caller's accessible enabled calendar accounts with opaque "
+        "account_ref values and protected labels. Never display account_ref values."
     ),
     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
 }
@@ -263,7 +263,7 @@ class GatewayCalendarMCP:
             account = template.for_identity(identity)
             if account is None:  # pragma: no cover - identity is derived from the template
                 raise RuntimeError("Static account owner configuration is invalid")
-            self._server_for(account).server.check_ready()
+            self._server_for(identity, account).server.check_ready()
 
     def build_sdk_server(self, identity: GatewayIdentity) -> Server[Any]:
         return build_mcp_sdk_server(
@@ -280,7 +280,7 @@ class GatewayCalendarMCP:
         arguments: dict[str, Any],
     ) -> dict[str, Any]:
         try:
-            permission = (
+            permission: Literal["read", "write"] = (
                 "write" if name in {"events_create", "events_update", "events_delete"} else "read"
             )
             if permission == "write":
@@ -338,7 +338,7 @@ class GatewayCalendarMCP:
             private_values[private_ref] = account.label
             status = account.status
             if account.kind == "ics":
-                key = (account.tenant_id, account.user_id, account.account_ref)
+                key = (identity.tenant_id, identity.user_id, account.account_ref)
                 with self._lock:
                     cached_server = self._servers.get(key)
                 if (
@@ -368,7 +368,7 @@ class GatewayCalendarMCP:
         if requested is not None and (not isinstance(requested, str) or not requested):
             raise TypeError("account_ref must be a non-empty string")
         accounts = (
-            [self._owned_enabled_account(identity, requested)]
+            [self._accessible_enabled_account(identity, requested)]
             if requested is not None
             else self._enabled_accounts(identity)
         )
@@ -377,7 +377,7 @@ class GatewayCalendarMCP:
         failed = 0
         for account in accounts:
             try:
-                account_server = self._server_for(account)
+                account_server = self._server_for(identity, account)
                 result = self._delegate(account_server.server, "calendars_list", {})
                 self._merge_private_values(private_values, result)
                 for calendar in result["structuredContent"]["calendars"]:
@@ -475,9 +475,12 @@ class GatewayCalendarMCP:
             if (account := self._static_account_for_identity(template, identity, "read"))
             is not None
         ]
-        dynamic_accounts = self._access_policy.list_personal_accounts(
-            identity, limit=100, enabled_only=True
-        )
+        dynamic_accounts = [
+            accessible.account
+            for accessible in self._access_policy.list_accessible(
+                identity, permission="read", limit=100
+            )
+        ]
         static_refs = {account.account_ref for account in static_accounts}
         return static_accounts + [
             account for account in dynamic_accounts if account.account_ref not in static_refs
@@ -487,7 +490,7 @@ class GatewayCalendarMCP:
         self,
         template: StaticGatewayAccount,
         identity: GatewayIdentity,
-        permission: str,
+        permission: Literal["read", "write"],
     ) -> GatewayAccount | None:
         access = self._store.resource_access(
             template.resource_id,
@@ -501,22 +504,24 @@ class GatewayCalendarMCP:
             return None
         return template.for_identity(identity)
 
-    def _owned_enabled_account(
-        self, identity: GatewayIdentity, account_ref: str, *, permission: str = "read"
+    def _accessible_enabled_account(
+        self,
+        identity: GatewayIdentity,
+        account_ref: str,
+        *,
+        permission: Literal["read", "write"] = "read",
     ) -> GatewayAccount:
         for template in self._static_accounts:
             static_account = self._static_account_for_identity(template, identity, permission)
             if static_account is not None and static_account.account_ref == account_ref:
                 return static_account
-        account = self._access_policy.get_personal_account(
-            identity, account_ref, require_enabled=True
-        )
-        if account is None:
+        accessible = self._access_policy.resolve(identity, account_ref, permission=permission)
+        if accessible is None:
             raise PermissionError("Unknown or unavailable account reference")
-        return account
+        return accessible.account
 
-    def _server_for(self, account: GatewayAccount) -> _AccountServer:
-        key = (account.tenant_id, account.user_id, account.account_ref)
+    def _server_for(self, identity: GatewayIdentity, account: GatewayAccount) -> _AccountServer:
+        key = (identity.tenant_id, identity.user_id, account.account_ref)
         with self._lock:
             cached = self._servers.get(key)
             if cached is not None and cached.account_updated_at == account.updated_at:
@@ -527,7 +532,7 @@ class GatewayCalendarMCP:
                 server=(
                     self._server_factory(account)
                     if self._server_factory is not None
-                    else self._default_server(account)
+                    else self._default_server(identity, account)
                 ),
             )
             self._servers[key] = current
@@ -555,7 +560,7 @@ class GatewayCalendarMCP:
         reference: str,
         reference_type: str,
         *,
-        permission: str = "read",
+        permission: Literal["read", "write"] = "read",
     ) -> tuple[GatewayAccount, _AccountServer]:
         stored = self._store.get_reference(identity.tenant_id, identity.user_id, reference)
         if stored is not None:
@@ -569,10 +574,12 @@ class GatewayCalendarMCP:
                 route = self._routes.get((identity.tenant_id, identity.user_id, reference))
         if route is None or route.reference_type != reference_type:
             raise PermissionError("Unknown or expired reference")
-        account = self._owned_enabled_account(identity, route.account_ref, permission=permission)
+        account = self._accessible_enabled_account(
+            identity, route.account_ref, permission=permission
+        )
         if account.updated_at != route.account_updated_at:
             raise PermissionError("Unknown or expired reference")
-        return account, self._server_for(account)
+        return account, self._server_for(identity, account)
 
     def _record_event_references(
         self, identity: GatewayIdentity, account: GatewayAccount, result: dict[str, Any]
@@ -586,11 +593,13 @@ class GatewayCalendarMCP:
             if isinstance(reference, str) and reference:
                 self._record_route(identity, reference, account, "event")
 
-    def _default_server(self, account: GatewayAccount) -> PrivateCalendarMCPServer:
+    def _default_server(
+        self, identity: GatewayIdentity, account: GatewayAccount
+    ) -> PrivateCalendarMCPServer:
         references = DurableReferenceCache[CachedReference](
             self._store,
-            tenant_id=account.tenant_id,
-            user_id=account.user_id,
+            tenant_id=identity.tenant_id,
+            user_id=identity.user_id,
             account_ref=account.account_ref,
             account_updated_at=account.updated_at,
             encode=_encode_calendar_reference,
