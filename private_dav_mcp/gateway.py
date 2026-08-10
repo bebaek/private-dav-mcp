@@ -906,7 +906,8 @@ def _candidate_account(
     return GatewayAccount(
         account_ref="pending",
         tenant_id=identity.tenant_id,
-        user_id=identity.user_id,
+        owner_type="user",
+        owner_user_id=identity.user_id,
         kind=kind,
         label=label,
         base_url=base_url,
@@ -923,6 +924,7 @@ def _candidate_account(
 def _account_response(account: GatewayAccount) -> dict[str, Any]:
     return {
         "account_ref": account.account_ref,
+        "owner_type": account.owner_type,
         "kind": account.kind,
         "label": account.label,
         "base_url": account.base_url,

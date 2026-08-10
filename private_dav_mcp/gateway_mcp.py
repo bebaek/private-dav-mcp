@@ -139,7 +139,8 @@ class StaticCalendarAccount:
         return GatewayAccount(
             account_ref=account_ref,
             tenant_id=identity.tenant_id,
-            user_id=identity.user_id,
+            owner_type="user",
+            owner_user_id=identity.user_id,
             kind="caldav",
             label=self.label,
             base_url=self.base_url,
@@ -199,7 +200,8 @@ class StaticICSSubscription:
         return GatewayAccount(
             account_ref=account_ref,
             tenant_id=identity.tenant_id,
-            user_id=identity.user_id,
+            owner_type="user",
+            owner_user_id=identity.user_id,
             kind="ics",
             label=self.label,
             base_url=self.url,
