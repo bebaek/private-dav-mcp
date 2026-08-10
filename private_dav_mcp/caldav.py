@@ -961,6 +961,12 @@ class PrivateCalendarMCPServer:
         self._references[reference] = CachedReference(value, self._clock() + self._ttl)
         return reference
 
+    def trusted_reference(self, reference: str) -> Calendar | EventResource | None:
+        """Resolve a reference for trusted gateway policy enforcement."""
+        self._prune()
+        cached = self._references.get(reference)
+        return cached.value if cached is not None else None
+
     def _resolve(self, reference: Any, expected_type: type[Calendar] | type[EventResource]) -> Any:
         self._prune()
         if not isinstance(reference, str) or not reference:

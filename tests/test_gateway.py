@@ -185,6 +185,15 @@ class FakeConnector:
     def __init__(self) -> None:
         self.calls: list[GatewayAccount] = []
 
+    def discover_calendars(self, account: GatewayAccount) -> list[Calendar]:
+        self.calls.append(account)
+        if account.credential.password == "bad-password":
+            raise AccountConnectionError("authentication_failed")
+        return [
+            Calendar("Personal", "https://dav.example/personal/", "#3366cc"),
+            Calendar("Work", "https://dav.example/calendars/work/", None),
+        ]
+
     def test(self, account: GatewayAccount) -> int:
         self.calls.append(account)
         if account.credential.password == "bad-password":
@@ -421,6 +430,168 @@ def test_account_lifecycle_is_owner_scoped_and_credentials_are_write_only(
     assert client.get(f"/v1/accounts/{account_ref}", headers=owner_headers).status_code == 404
 
 
+def test_calendar_preferences_are_scoped_encrypted_and_enforced_by_mcp(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, db_path = gateway
+    owner = _headers(
+        private_pem,
+        scopes="dav:accounts:read dav:accounts:write dav:calendar:read dav:calendar:write",
+    )
+    created = client.post(
+        "/v1/accounts",
+        headers=owner,
+        json=_account_payload(password="calendar-preference-secret"),
+    )
+    assert created.status_code == 201
+    account_ref = created.json()["account_ref"]
+
+    mcp_calendars = _mcp(
+        client,
+        owner,
+        "tools/call",
+        {"name": "calendars_list", "arguments": {"account_ref": account_ref}},
+    )["result"]
+    mcp_calendar_ref = mcp_calendars["structuredContent"]["calendars"][0]["calendar_ref"]
+
+    listed = client.get(f"/v1/accounts/{account_ref}/calendars", headers=owner)
+    assert listed.status_code == 200, listed.text
+    calendars = listed.json()["calendars"]
+    assert [(item["name"], item["enabled"]) for item in calendars] == [
+        ("Personal", True),
+        ("Work", True),
+    ]
+    personal = calendars[0]
+    repeated = client.get(f"/v1/accounts/{account_ref}/calendars", headers=owner)
+    assert repeated.json()["calendars"][0]["calendar_ref"] == personal["calendar_ref"]
+    cross_owner = client.get(
+        f"/v1/accounts/{account_ref}/calendars",
+        headers=_headers(
+            private_pem,
+            user_id="user-b",
+            scopes="dav:accounts:read",
+        ),
+    )
+    assert cross_owner.status_code == 404
+
+    disabled = client.patch(
+        f"/v1/accounts/{account_ref}/calendars/{personal['calendar_ref']}",
+        headers=owner,
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200
+    assert disabled.json()["enabled"] is False
+    filtered = _mcp(
+        client,
+        owner,
+        "tools/call",
+        {"name": "calendars_list", "arguments": {"account_ref": account_ref}},
+    )["result"]
+    assert filtered["structuredContent"]["calendars"] == []
+    assert filtered["_meta"][PRIVATE_VALUES_META_KEY] == {}
+    free_busy = _mcp(
+        client,
+        owner,
+        "tools/call",
+        {
+            "name": "free_busy",
+            "arguments": {
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )["result"]
+    assert free_busy["structuredContent"]["queried_calendar_count"] == 0
+    assert free_busy["structuredContent"]["busy"] == []
+    rejected_reference = _mcp(
+        client,
+        owner,
+        "tools/call",
+        {
+            "name": "events_list",
+            "arguments": {
+                "calendar_ref": mcp_calendar_ref,
+                "start": "2026-08-01T00:00:00Z",
+                "end": "2026-08-02T00:00:00Z",
+            },
+        },
+    )
+    assert rejected_reference["error"]["code"] == -32001
+
+    enabled = client.patch(
+        f"/v1/accounts/{account_ref}/calendars/{personal['calendar_ref']}",
+        headers=owner,
+        json={"enabled": True},
+    )
+    assert enabled.status_code == 200
+    assert (
+        len(
+            _mcp(
+                client,
+                owner,
+                "tools/call",
+                {"name": "calendars_list", "arguments": {"account_ref": account_ref}},
+            )["result"]["structuredContent"]["calendars"]
+        )
+        == 1
+    )
+
+    rotated = client.patch(
+        f"/v1/accounts/{account_ref}",
+        headers=owner,
+        json={
+            "auth": {
+                "type": "password",
+                "username": "rotated-user",
+                "password": "rotated-secret",
+                "mode": "basic",
+            }
+        },
+    )
+    assert rotated.status_code == 200
+    rediscovered = client.get(f"/v1/accounts/{account_ref}/calendars", headers=owner)
+    assert rediscovered.status_code == 200
+    assert rediscovered.json()["calendars"][0]["calendar_ref"] != personal["calendar_ref"]
+    assert b"https://dav.example/personal/" not in db_path.read_bytes()
+
+    tenant_admin = _headers(
+        private_pem,
+        scopes="dav:tenant-accounts:read dav:tenant-accounts:write",
+    )
+    tenant_payload = _account_payload(password="tenant-calendar-preference")
+    tenant_created = client.post("/v1/tenant/accounts", headers=tenant_admin, json=tenant_payload)
+    assert tenant_created.status_code == 201
+    tenant_ref = tenant_created.json()["account_ref"]
+    tenant_calendars = client.get(
+        f"/v1/tenant/accounts/{tenant_ref}/calendars", headers=tenant_admin
+    )
+    assert tenant_calendars.status_code == 200
+    tenant_calendar_ref = tenant_calendars.json()["calendars"][0]["calendar_ref"]
+    tenant_disabled = client.patch(
+        f"/v1/tenant/accounts/{tenant_ref}/calendars/{tenant_calendar_ref}",
+        headers=tenant_admin,
+        json={"enabled": False},
+    )
+    assert tenant_disabled.status_code == 200
+    assert tenant_disabled.json()["enabled"] is False
+    assert (
+        client.get(
+            f"/v1/tenant/accounts/{tenant_ref}/calendars",
+            headers=_headers(
+                private_pem,
+                tenant_id="tenant-b",
+                scopes="dav:tenant-accounts:read",
+            ),
+        ).status_code
+        == 404
+    )
+
+    assert client.delete(f"/v1/accounts/{account_ref}", headers=owner).status_code == 204
+    assert (
+        client.delete(f"/v1/tenant/accounts/{tenant_ref}", headers=tenant_admin).status_code == 204
+    )
+
+
 def test_carddav_personal_and_tenant_account_lifecycle(
     gateway: tuple[TestClient, str, FakeConnector, Path],
 ) -> None:
@@ -443,6 +614,10 @@ def test_carddav_personal_and_tenant_account_lifecycle(
     assert created.json()["addressbook_count"] == 2
     assert "calendar_count" not in created.json()
     personal_ref = created.json()["account_ref"]
+    assert (
+        client.get(f"/v1/accounts/{personal_ref}/calendars", headers=personal_headers).status_code
+        == 404
+    )
     assert connector.calls[-1].kind == "carddav"
 
     tested = client.post(f"/v1/accounts/{personal_ref}/test", headers=personal_headers)
@@ -474,6 +649,12 @@ def test_carddav_personal_and_tenant_account_lifecycle(
     assert tenant_created.json()["kind"] == "carddav"
     assert tenant_created.json()["addressbook_count"] == 2
     tenant_ref = tenant_created.json()["account_ref"]
+    assert (
+        client.get(
+            f"/v1/tenant/accounts/{tenant_ref}/calendars", headers=tenant_headers
+        ).status_code
+        == 404
+    )
     tenant_tested = client.post(f"/v1/tenant/accounts/{tenant_ref}/test", headers=tenant_headers)
     assert tenant_tested.status_code == 200
     assert tenant_tested.json()["addressbook_count"] == 2

@@ -69,6 +69,20 @@ class TenantAccountAudit:
 
 
 @dataclass(frozen=True)
+class CalendarPreference:
+    calendar_ref: str
+    account_ref: str
+    tenant_id: str
+    href: str
+    name: str
+    color: str | None
+    enabled: bool
+    read_only: bool
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
 class AccountGrant:
     account_ref: str
     tenant_id: str
@@ -449,6 +463,210 @@ class AccountStore:
             connection.commit()
         return account, True
 
+    def sync_calendar_preferences(
+        self,
+        account: GatewayAccount,
+        calendars: list[tuple[str, str, str | None, bool]],
+    ) -> list[CalendarPreference]:
+        if account.kind != "caldav":
+            raise ValueError("Calendar preferences require a CalDAV account")
+        if len(calendars) > 500 or len({item[0] for item in calendars}) != len(calendars):
+            raise ValueError("Discovered calendars are invalid")
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            stored_rows = connection.execute(
+                """
+                SELECT * FROM dav_calendar_preferences
+                WHERE tenant_id = ? AND account_ref = ?
+                """,
+                (account.tenant_id, account.account_ref),
+            ).fetchall()
+            stored = [self._calendar_preference_from_row(row) for row in stored_rows]
+            by_href = {item.href: item for item in stored}
+            keep: list[str] = []
+            for position, (href, name, color, read_only) in enumerate(calendars):
+                current = by_href.get(href)
+                calendar_ref = (
+                    current.calendar_ref
+                    if current is not None
+                    else f"cal_{secrets.token_urlsafe(24)}"
+                )
+                created_at = current.created_at if current is not None else now
+                enabled = current.enabled if current is not None else True
+                payload = json.dumps(
+                    {
+                        "href": href,
+                        "name": name,
+                        "color": color,
+                        "read_only": read_only,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+                aad = _calendar_preference_aad(account.tenant_id, account.account_ref, calendar_ref)
+                key_version, payload_cipher = self._cipher.encrypt_reference(payload, aad=aad)
+                connection.execute(
+                    """
+                    INSERT INTO dav_calendar_preferences (
+                      calendar_ref, account_ref, tenant_id, key_version, payload_cipher,
+                      enabled, position, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(calendar_ref) DO UPDATE SET
+                      key_version = excluded.key_version,
+                      payload_cipher = excluded.payload_cipher,
+                      enabled = excluded.enabled,
+                      position = excluded.position,
+                      updated_at = excluded.updated_at
+                    """,
+                    (
+                        calendar_ref,
+                        account.account_ref,
+                        account.tenant_id,
+                        key_version,
+                        payload_cipher,
+                        int(enabled),
+                        position,
+                        created_at,
+                        now,
+                    ),
+                )
+                keep.append(calendar_ref)
+            if keep:
+                placeholders = ",".join("?" for _ in keep)
+                connection.execute(
+                    f"""
+                    DELETE FROM dav_calendar_preferences
+                    WHERE tenant_id = ? AND account_ref = ?
+                      AND calendar_ref NOT IN ({placeholders})
+                    """,  # noqa: S608 - placeholders are generated, not user input
+                    (account.tenant_id, account.account_ref, *keep),
+                )
+            else:
+                connection.execute(
+                    """
+                    DELETE FROM dav_calendar_preferences
+                    WHERE tenant_id = ? AND account_ref = ?
+                    """,
+                    (account.tenant_id, account.account_ref),
+                )
+            rows = connection.execute(
+                """
+                SELECT * FROM dav_calendar_preferences
+                WHERE tenant_id = ? AND account_ref = ?
+                ORDER BY position, calendar_ref
+                """,
+                (account.tenant_id, account.account_ref),
+            ).fetchall()
+            connection.commit()
+        return [self._calendar_preference_from_row(row) for row in rows]
+
+    def list_calendar_preferences(
+        self, tenant_id: str, account_ref: str
+    ) -> list[CalendarPreference]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM dav_calendar_preferences
+                WHERE tenant_id = ? AND account_ref = ?
+                ORDER BY position, calendar_ref
+                """,
+                (tenant_id, account_ref),
+            ).fetchall()
+        return [self._calendar_preference_from_row(row) for row in rows]
+
+    def set_calendar_enabled(
+        self,
+        tenant_id: str,
+        account_ref: str,
+        calendar_ref: str,
+        *,
+        enabled: bool,
+        actor_user_id: str,
+        audit_operation: str,
+    ) -> CalendarPreference | None:
+        if not actor_user_id or not audit_operation:
+            raise ValueError("Calendar preference audit identity is required")
+        now = _utc_now()
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE dav_calendar_preferences SET enabled = ?, updated_at = ?
+                WHERE tenant_id = ? AND account_ref = ? AND calendar_ref = ?
+                """,
+                (int(enabled), now, tenant_id, account_ref, calendar_ref),
+            )
+            if cursor.rowcount != 1:
+                return None
+            row = connection.execute(
+                """
+                SELECT * FROM dav_calendar_preferences
+                WHERE tenant_id = ? AND account_ref = ? AND calendar_ref = ?
+                """,
+                (tenant_id, account_ref, calendar_ref),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO gateway_audit
+                  (tenant_id, user_id, account_ref, operation, outcome, created_at)
+                VALUES (?, ?, ?, ?, 'success', ?)
+                """,
+                (tenant_id, actor_user_id, account_ref, audit_operation, now),
+            )
+            connection.commit()
+        if row is None:  # pragma: no cover - defensive
+            raise RuntimeError("Calendar preference was not saved")
+        return self._calendar_preference_from_row(row)
+
+    def delete_calendar_preferences(self, tenant_id: str, account_ref: str) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                DELETE FROM dav_calendar_preferences
+                WHERE tenant_id = ? AND account_ref = ?
+                """,
+                (tenant_id, account_ref),
+            )
+            connection.commit()
+
+    def _calendar_preference_from_row(self, row: sqlite3.Row) -> CalendarPreference:
+        tenant_id = str(row["tenant_id"])
+        account_ref = str(row["account_ref"])
+        calendar_ref = str(row["calendar_ref"])
+        aad = _calendar_preference_aad(tenant_id, account_ref, calendar_ref)
+        payload = json.loads(
+            self._cipher.decrypt_reference(
+                bytes(row["payload_cipher"]),
+                key_version=int(row["key_version"]),
+                aad=aad,
+            )
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError("Encrypted calendar preference is invalid")
+        href = payload.get("href")
+        name = payload.get("name")
+        color = payload.get("color")
+        read_only = payload.get("read_only")
+        if (
+            not isinstance(href, str)
+            or not isinstance(name, str)
+            or (color is not None and not isinstance(color, str))
+            or not isinstance(read_only, bool)
+        ):
+            raise RuntimeError("Encrypted calendar preference is invalid")
+        return CalendarPreference(
+            calendar_ref=calendar_ref,
+            account_ref=account_ref,
+            tenant_id=tenant_id,
+            href=href,
+            name=name,
+            color=color,
+            enabled=bool(row["enabled"]),
+            read_only=read_only,
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
     def list_tenant_accounts(self, tenant_id: str, *, limit: int) -> list[GatewayAccount]:
         if limit < 1:
             raise ValueError("Tenant account limit must be positive")
@@ -565,7 +783,13 @@ class AccountStore:
         )
         return permission, source
 
-    def update_account(self, account: GatewayAccount, *, audit_operation: str) -> GatewayAccount:
+    def update_account(
+        self,
+        account: GatewayAccount,
+        *,
+        audit_operation: str,
+        clear_calendar_preferences: bool = False,
+    ) -> GatewayAccount:
         updated = replace(account, updated_at=_utc_now())
         encrypted = self._encrypt_account(updated)
         with self._connect() as connection:
@@ -602,6 +826,14 @@ class AccountStore:
                 "DELETE FROM dav_references WHERE tenant_id = ? AND user_id = ? AND account_ref = ?",
                 (updated.tenant_id, updated.user_id, updated.account_ref),
             )
+            if clear_calendar_preferences:
+                connection.execute(
+                    """
+                    DELETE FROM dav_calendar_preferences
+                    WHERE tenant_id = ? AND account_ref = ?
+                    """,
+                    (updated.tenant_id, updated.account_ref),
+                )
             self._audit(connection, updated, audit_operation, "success")
             connection.commit()
         return updated
@@ -631,6 +863,7 @@ class AccountStore:
         *,
         actor_user_id: str,
         audit_operation: str,
+        clear_calendar_preferences: bool = False,
     ) -> GatewayAccount:
         if account.owner_type != "tenant" or account.owner_user_id is not None:
             raise ValueError("Tenant account ownership is required")
@@ -672,6 +905,14 @@ class AccountStore:
                 "DELETE FROM dav_references WHERE tenant_id = ? AND account_ref = ?",
                 (updated.tenant_id, updated.account_ref),
             )
+            if clear_calendar_preferences:
+                connection.execute(
+                    """
+                    DELETE FROM dav_calendar_preferences
+                    WHERE tenant_id = ? AND account_ref = ?
+                    """,
+                    (updated.tenant_id, updated.account_ref),
+                )
             self._audit_tenant_account(
                 connection,
                 updated,
@@ -1358,6 +1599,36 @@ class AccountStore:
                     (key_version, payload_cipher, str(row["token_hash"])),
                 )
                 rotated += 1
+            preference_rows = connection.execute(
+                "SELECT * FROM dav_calendar_preferences WHERE key_version != ?",
+                (self._cipher.active_version,),
+            ).fetchall()
+            for row in preference_rows:
+                tenant_id = str(row["tenant_id"])
+                account_ref = str(row["account_ref"])
+                calendar_ref = str(row["calendar_ref"])
+                aad = _calendar_preference_aad(tenant_id, account_ref, calendar_ref)
+                payload = self._cipher.decrypt_reference(
+                    bytes(row["payload_cipher"]),
+                    key_version=int(row["key_version"]),
+                    aad=aad,
+                )
+                key_version, payload_cipher = self._cipher.encrypt_reference(payload, aad=aad)
+                connection.execute(
+                    """
+                    UPDATE dav_calendar_preferences
+                    SET key_version = ?, payload_cipher = ?
+                    WHERE calendar_ref = ? AND tenant_id = ? AND account_ref = ?
+                    """,
+                    (
+                        key_version,
+                        payload_cipher,
+                        calendar_ref,
+                        tenant_id,
+                        account_ref,
+                    ),
+                )
+                rotated += 1
             connection.commit()
         return rotated
 
@@ -1573,6 +1844,22 @@ class AccountStore:
                   PRIMARY KEY (tenant_id, idempotency_key)
                 );
 
+                CREATE TABLE IF NOT EXISTS dav_calendar_preferences (
+                  calendar_ref TEXT PRIMARY KEY,
+                  account_ref TEXT NOT NULL,
+                  tenant_id TEXT NOT NULL,
+                  key_version INTEGER NOT NULL,
+                  payload_cipher BLOB NOT NULL,
+                  enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+                  position INTEGER NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  FOREIGN KEY (account_ref, tenant_id)
+                    REFERENCES dav_accounts(account_ref, tenant_id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS dav_calendar_preferences_account
+                  ON dav_calendar_preferences (tenant_id, account_ref, created_at);
+
                 CREATE TABLE IF NOT EXISTS dav_account_grants (
                   account_ref TEXT NOT NULL,
                   tenant_id TEXT NOT NULL,
@@ -1717,7 +2004,7 @@ class AccountStore:
                   outcome TEXT NOT NULL,
                   created_at TEXT NOT NULL
                 );
-                PRAGMA user_version = 7;
+                PRAGMA user_version = 8;
                 """
             )
             pre_migration_columns = {
@@ -1855,7 +2142,7 @@ class AccountStore:
                       ON dav_references (tenant_id, user_id, account_ref, reference_type);
                     """
                 )
-            connection.execute("PRAGMA user_version = 7")
+            connection.execute("PRAGMA user_version = 8")
             violations = connection.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
                 raise RuntimeError("Account database foreign key migration failed")
@@ -1996,6 +2283,10 @@ def _account_aad_v2(
 
 def _reference_hash(reference: str) -> str:
     return hashlib.sha256(reference.encode()).hexdigest()
+
+
+def _calendar_preference_aad(tenant_id: str, account_ref: str, calendar_ref: str) -> bytes:
+    return f"private-dav-calendar-preference|{tenant_id}|{account_ref}|{calendar_ref}".encode()
 
 
 def _reference_aad(

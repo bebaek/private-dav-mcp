@@ -513,7 +513,10 @@ Response:
 ```
 
 The REST representation may show calendar names to the authenticated user. Upstream hrefs are
-never returned.
+never returned and are encrypted at rest with names, colors, and read-only metadata. Discovery is
+live on each GET; an unchanged upstream href retains its opaque `calendar_ref` and enabled state,
+while calendars no longer discovered are removed. CardDAV accounts and cross-owner or cross-tenant
+account references return the same `404` response.
 
 ```http
 PATCH /v1/accounts/{account_ref}/calendars/{calendar_ref}
@@ -524,7 +527,13 @@ Scope: dav:accounts:write
 {"enabled": false}
 ```
 
-A disabled calendar is excluded from implicit multi-calendar free/busy and rejects event access.
+A disabled calendar is excluded from MCP `calendars_list` and implicit multi-calendar free/busy.
+Existing calendar and event references for it fail with the same non-enumerating authorization error
+as unknown or expired references. Re-enabling restores discovery but does not resurrect expired
+references. Rotating credentials or changing `base_url` clears discovered preferences; the next GET
+rediscovers calendars with new opaque preference references. Preference changes write non-sensitive
+management audit entries containing the tenant, actor, account reference, operation, outcome, and
+timestamp, but not the calendar reference, name, color, or href.
 
 ## MCP interface
 
