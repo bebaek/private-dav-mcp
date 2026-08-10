@@ -87,6 +87,20 @@ class AccountAccessPolicy:
                 accessible.append(effective)
         return accessible
 
+    def get_tenant_account(
+        self,
+        identity: GatewayIdentity,
+        account_ref: str,
+        *,
+        require_enabled: bool = False,
+    ) -> GatewayAccount | None:
+        account = self._repository.get_account_for_tenant(identity.tenant_id, account_ref)
+        if account is None or account.owner_type != "tenant":
+            return None
+        if require_enabled and not account.enabled:
+            return None
+        return account
+
     def get_personal_account(
         self,
         identity: GatewayIdentity,

@@ -211,6 +211,124 @@ def test_new_account_ciphertext_is_bound_to_explicit_ownership(tmp_path: Path) -
         store.get_account("tenant-a", "user-a", account.account_ref)
 
 
+def _insert_tenant_account(store: AccountStore, account_ref: str, tenant_id: str) -> GatewayAccount:
+    account = GatewayAccount(
+        account_ref=account_ref,
+        tenant_id=tenant_id,
+        owner_type="tenant",
+        owner_user_id=None,
+        kind="caldav",
+        label="Tenant calendar",
+        base_url="https://dav.example/tenant/",
+        credential=PasswordCredential(
+            username="tenant-user", password="tenant-secret", mode="basic"
+        ),
+        status="ready",
+        enabled=True,
+        last_checked_at=None,
+        last_error=None,
+        created_at="2026-08-10T00:00:00Z",
+        updated_at="2026-08-10T00:00:00Z",
+    )
+    with store._connect() as connection:  # noqa: SLF001 - storage integration fixture
+        store._insert_account(connection, account)  # noqa: SLF001 - storage integration fixture
+        connection.commit()
+    return account
+
+
+def test_account_grant_mutations_are_tenant_scoped_and_audited(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "account-grants.db", cipher=_cipher())
+    account = _insert_tenant_account(store, "acct_tenant", "tenant-a")
+    personal, _created = store.create_account(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        kind="caldav",
+        label="Personal",
+        base_url="https://dav.example/personal/",
+        credential=PasswordCredential(username="user", password="secret", mode="basic"),
+        enabled=True,
+        status="ready",
+        last_error=None,
+        idempotency_key=None,
+        request_hash=None,
+    )
+
+    created = store.upsert_account_grant(
+        account_ref=account.account_ref,
+        tenant_id="tenant-a",
+        user_id="user-b",
+        permission="read",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    assert created.permission == "read"
+    assert created.enabled is True
+
+    updated = store.upsert_account_grant(
+        account_ref=account.account_ref,
+        tenant_id="tenant-a",
+        user_id="user-b",
+        permission="read_write",
+        enabled=False,
+        updated_by="admin-b",
+    )
+    assert updated.permission == "read_write"
+    assert updated.enabled is False
+    assert updated.created_at == created.created_at
+    assert updated.updated_by == "admin-b"
+
+    store.upsert_account_grant(
+        account_ref=account.account_ref,
+        tenant_id="tenant-a",
+        user_id="user-b",
+        permission="read_write",
+        enabled=False,
+        updated_by="admin-b",
+    )
+    assert store.delete_account_grant(
+        account.account_ref,
+        "tenant-a",
+        "user-b",
+        deleted_by="admin-a",
+    )
+    assert store.list_account_grants(account.account_ref, "tenant-a") == []
+
+    audit = store.list_account_grant_audit("tenant-a", limit=10)
+    assert [entry.operation for entry in audit] == [
+        "account_grant.delete",
+        "account_grant.touch",
+        "account_grant.update",
+        "account_grant.create",
+    ]
+    assert audit[0].actor_id == "admin-a"
+    assert audit[0].previous_permission == "read_write"
+    assert audit[0].resulting_permission is None
+    assert (
+        store.list_account_grant_audit("tenant-a", limit=10, before_id=audit[1].audit_id)
+        == audit[2:]
+    )
+    assert store.list_account_grant_audit("tenant-b", limit=10) == []
+
+    with pytest.raises(LookupError, match="Tenant-owned account not found"):
+        store.upsert_account_grant(
+            account_ref=account.account_ref,
+            tenant_id="tenant-b",
+            user_id="user-b",
+            permission="read",
+            enabled=True,
+            updated_by="admin-b",
+        )
+    with pytest.raises(LookupError, match="Tenant-owned account not found"):
+        store.upsert_account_grant(
+            account_ref=personal.account_ref,
+            tenant_id="tenant-a",
+            user_id="user-b",
+            permission="read",
+            enabled=True,
+            updated_by="admin-a",
+        )
+
+
 def test_account_grant_schema_enforces_tenant_fk_audit_and_cascade(tmp_path: Path) -> None:
     database = tmp_path / "grants.db"
     store = AccountStore(database, cipher=_cipher())

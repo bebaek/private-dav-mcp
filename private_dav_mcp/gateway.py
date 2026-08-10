@@ -41,6 +41,8 @@ from private_dav_mcp.mcp_sdk import run_mcp_sdk_request
 
 ACCOUNTS_READ_SCOPE = "dav:accounts:read"
 ACCOUNTS_WRITE_SCOPE = "dav:accounts:write"
+ACCOUNT_GRANTS_READ_SCOPE = "dav:account-grants:read"
+ACCOUNT_GRANTS_WRITE_SCOPE = "dav:account-grants:write"
 GRANTS_READ_SCOPE = "dav:grants:read"
 GRANTS_WRITE_SCOPE = "dav:grants:write"
 
@@ -187,6 +189,14 @@ class PasswordAuthInput(BaseModel):
     username: str = Field(min_length=1, max_length=320)
     password: SecretStr = Field(min_length=1, max_length=4096)
     mode: str = Field(pattern="^(auto|basic|digest)$")
+
+
+class AccountGrantPutInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    user_id: str = Field(min_length=1, max_length=200)
+    permission: str = Field(pattern="^(read|read_write)$")
+    enabled: bool = True
 
 
 class ResourceGrantPutInput(BaseModel):
@@ -711,6 +721,92 @@ def create_gateway_app(
             raise GatewayAPIError(404, "not_found", "Resource grant was not found.")
         return Response(status_code=204)
 
+    @app.get("/v1/tenant/accounts/{account_ref}/grants")
+    async def list_account_grants(
+        account_ref: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, ACCOUNT_GRANTS_READ_SCOPE)
+        await _tenant_owned_account(account_access_policy, identity, account_ref)
+        grants = await run_in_threadpool(store.list_account_grants, account_ref, identity.tenant_id)
+        return {"grants": [_account_grant_response(grant) for grant in grants]}
+
+    @app.put("/v1/tenant/accounts/{account_ref}/grants")
+    async def put_account_grant(
+        account_ref: str,
+        payload: AccountGrantPutInput,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, ACCOUNT_GRANTS_WRITE_SCOPE)
+        await _tenant_owned_account(account_access_policy, identity, account_ref)
+        try:
+            grant = await run_in_threadpool(
+                store.upsert_account_grant,
+                account_ref=account_ref,
+                tenant_id=identity.tenant_id,
+                user_id=payload.user_id,
+                permission=payload.permission,
+                enabled=payload.enabled,
+                updated_by=identity.user_id,
+            )
+        except LookupError as exc:  # pragma: no cover - guarded above and checked transactionally
+            raise GatewayAPIError(404, "not_found", "Account was not found.") from exc
+        except OverflowError as exc:
+            raise GatewayAPIError(
+                409,
+                "account_grant_limit_reached",
+                "Account grant limit was reached.",
+            ) from exc
+        return _account_grant_response(grant)
+
+    @app.delete("/v1/tenant/accounts/{account_ref}/grants/{user_id}", status_code=204)
+    async def delete_account_grant(
+        account_ref: str,
+        user_id: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> Response:
+        require_scope(identity, ACCOUNT_GRANTS_WRITE_SCOPE)
+        if not 1 <= len(user_id) <= 200:
+            raise GatewayAPIError(422, "invalid_request", "Account grant user ID is invalid.")
+        await _tenant_owned_account(account_access_policy, identity, account_ref)
+        try:
+            deleted = await run_in_threadpool(
+                store.delete_account_grant,
+                account_ref,
+                identity.tenant_id,
+                user_id,
+                deleted_by=identity.user_id,
+            )
+        except LookupError as exc:  # pragma: no cover - guarded above and checked transactionally
+            raise GatewayAPIError(404, "not_found", "Account was not found.") from exc
+        if not deleted:
+            raise GatewayAPIError(404, "not_found", "Account grant was not found.")
+        return Response(status_code=204)
+
+    @app.get("/v1/tenant/account-grant-audit")
+    async def list_account_grant_audit(
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+        limit: int = 100,
+        before_id: int | None = None,
+    ) -> dict[str, Any]:
+        require_scope(identity, ACCOUNT_GRANTS_READ_SCOPE)
+        if limit < 1 or limit > 500:
+            raise GatewayAPIError(422, "invalid_request", "Limit must be between 1 and 500.")
+        if before_id is not None and before_id < 1:
+            raise GatewayAPIError(422, "invalid_request", "Audit cursor must be positive.")
+        entries = await run_in_threadpool(
+            store.list_account_grant_audit,
+            identity.tenant_id,
+            limit=limit + 1,
+            before_id=before_id,
+        )
+        has_more = len(entries) > limit
+        entries = entries[:limit]
+        return {
+            "entries": [_account_grant_audit_response(entry) for entry in entries],
+            "next_cursor": entries[-1].audit_id if has_more else None,
+        }
+
     @app.get("/v1/accounts")
     async def list_accounts(
         identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
@@ -861,6 +957,15 @@ def create_gateway_app(
     return app
 
 
+async def _tenant_owned_account(
+    access_policy: AccountAccessPolicy, identity: GatewayIdentity, account_ref: str
+) -> GatewayAccount:
+    account = await run_in_threadpool(access_policy.get_tenant_account, identity, account_ref)
+    if account is None:
+        raise GatewayAPIError(404, "not_found", "Account was not found.")
+    return account
+
+
 async def _owned_account(
     access_policy: AccountAccessPolicy, identity: GatewayIdentity, account_ref: str
 ) -> GatewayAccount:
@@ -989,6 +1094,41 @@ def _resource_response(resource: DAVResource) -> dict[str, Any]:
         "allowed_permissions": list(resource.allowed_permissions),
         "configured": resource.configured,
         "enabled": resource.enabled,
+    }
+
+
+def _account_grant_response(grant: Any) -> dict[str, Any]:
+    return {
+        "account_ref": grant.account_ref,
+        "tenant_id": grant.tenant_id,
+        "user_id": grant.user_id,
+        "permission": grant.permission,
+        "enabled": grant.enabled,
+        "updated_by": grant.updated_by,
+        "created_at": grant.created_at,
+        "updated_at": grant.updated_at,
+    }
+
+
+def _account_grant_audit_response(entry: Any) -> dict[str, Any]:
+    return {
+        "audit_id": entry.audit_id,
+        "account_ref": entry.account_ref,
+        "tenant_id": entry.tenant_id,
+        "user_id": entry.user_id,
+        "actor_id": entry.actor_id,
+        "operation": entry.operation,
+        "previous": (
+            {"permission": entry.previous_permission, "enabled": entry.previous_enabled}
+            if entry.previous_permission is not None
+            else None
+        ),
+        "resulting": (
+            {"permission": entry.resulting_permission, "enabled": entry.resulting_enabled}
+            if entry.resulting_permission is not None
+            else None
+        ),
+        "created_at": entry.created_at,
     }
 
 
