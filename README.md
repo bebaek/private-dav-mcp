@@ -34,10 +34,9 @@ privacy gateway with a management API and MCP interface. See
 [ADR 0001](docs/adr/0001-multitenant-dav-privacy-gateway.md) and the draft
 [gateway contract v1](docs/gateway-contract-v1.md). The gateway now includes identity-token
 verification, an encrypted SQLite account vault, outbound URL policy, owner-scoped account
-lifecycle endpoints for CalDAV and CardDAV accounts, an authenticated multi-account calendar MCP
-endpoint, and an authenticated static CardDAV compatibility endpoint, plus encrypted
-owner/account-bound SQLite references that survive gateway process replacement and resolve across
-replicas. Calendar preference routes and account-backed CardDAV MCP routing remain planned;
+lifecycle endpoints for CalDAV and CardDAV accounts, authenticated multi-account calendar and
+contact MCP endpoints, plus encrypted owner/account-bound SQLite references that survive gateway
+process replacement and resolve across replicas. Calendar preference routes remain planned;
 standalone sidecar executables remain available for compatibility.
 
 To run that suite locally:
@@ -242,16 +241,18 @@ Implemented interfaces:
 - `POST /v1/accounts/{account_ref}/test`
 - `POST /mcp` with `calendar_accounts_list`, `calendars_list`, event tools, and multi-calendar
   `free_busy`
-- `POST /contacts/mcp` with authenticated contact read, protection, and mutation tools
+- `POST /contacts/mcp` with `contact_accounts_list`, multi-account contact listing, trusted
+  cross-account protection, and caller/account-routed mutation tools
 - `GET /health/live`
 - `GET /health/ready`
 
 Credential fields submitted through the management API are write-only. Both personal and
 tenant-owned account routes accept `kind: "caldav"` and `kind: "carddav"`; successful CardDAV
-connection tests return `addressbook_count` instead of `calendar_count`. Account-backed CardDAV MCP
-routing remains a separate migration slice, so `/contacts/mcp` continues to use only its configured
-static compatibility account in this release. Account labels, URLs, usernames, and passwords are
-encrypted at rest with a per-account DEK wrapped by the active deployment KEK.
+connection tests return `addressbook_count` instead of `calendar_count`. `/contacts/mcp` combines
+personal, granted tenant-owned, and authorized static CardDAV accounts. Contact reads require
+`dav:contacts:read` plus effective account read access; mutations require `dav:contacts:write` plus
+`read_write`. Account labels, URLs, usernames, and passwords are encrypted at rest with a
+per-account DEK wrapped by the active deployment KEK.
 Environment-configured accounts remain in the environment and bypass database onboarding. Static
 resource grants contain no DAV credentials and dynamically authorize static sources by tenant and
 user. Personal accounts are bound to the tenant and user from the verified

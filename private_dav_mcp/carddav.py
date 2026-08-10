@@ -702,6 +702,17 @@ class PrivateContactsMCPServer:
             message="Deleted the contact.",
         )
 
+    def trusted_contact_resources(self) -> list[ContactResource]:
+        """Return bounded resources for trusted gateway-wide name protection."""
+        resources, _truncated = self._contact_source.list_contact_resources(
+            limit=MAX_CONTACT_REFERENCES
+        )
+        return resources
+
+    def cache_trusted_contact(self, resource: ContactResource) -> str:
+        """Cache a trusted resource in this server's caller-bound reference namespace."""
+        return self._cache_contact(resource)
+
     def _handle_contacts_protect_text(self, arguments: dict[str, Any]) -> dict[str, Any]:
         if set(arguments) != {"text"} or not isinstance(arguments.get("text"), str):
             return _tool_error(

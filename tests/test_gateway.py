@@ -29,7 +29,13 @@ from private_dav_mcp.caldav import (
     PrivateCalendarMCPServer,
     StaticCalendarSource,
 )
-from private_dav_mcp.carddav import CachedContact, Contact, PrivateContactsMCPServer
+from private_dav_mcp.carddav import (
+    CachedContact,
+    Contact,
+    ContactResource,
+    PrivateContactsMCPServer,
+    StaticContactSource,
+)
 from private_dav_mcp.gateway import (
     AccountConnectionError,
     DAVAccountConnector,
@@ -228,6 +234,10 @@ def gateway(
             addressbook_url="https://dav.example/addressbooks/",
             username="contacts-user",
             password="contacts-secret",
+        ),
+        store=store,
+        account_server_factory=lambda _account: PrivateContactsMCPServer(
+            contacts=[Contact("Managed Person", emails=("managed@example.com",))]
         ),
         server_factory=lambda _account: PrivateContactsMCPServer(
             contacts=[Contact("Private Person", emails=("private@example.com",))]
@@ -496,6 +506,22 @@ def _mcp(
     if params is not None:
         payload["params"] = params
     response = client.post("/mcp", headers=headers, json=payload)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _contacts_mcp(
+    client: TestClient,
+    headers: dict[str, str],
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    request_id: int = 1,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+    if params is not None:
+        payload["params"] = params
+    response = client.post("/contacts/mcp", headers=headers, json=payload)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -1392,6 +1418,180 @@ def test_shared_tenant_account_mcp_is_grant_aware_and_caller_bound(
     )
 
 
+def test_shared_tenant_carddav_mcp_is_grant_aware_and_caller_bound(
+    gateway: tuple[TestClient, str, FakeConnector, Path],
+) -> None:
+    client, private_pem, _connector, _db_path = gateway
+    tenant_admin = _headers(
+        private_pem,
+        scopes="dav:tenant-accounts:write dav:account-grants:write",
+    )
+    payload = _account_payload(password="shared-carddav-secret")
+    payload.update(
+        {
+            "kind": "carddav",
+            "label": "Shared tenant contacts",
+            "base_url": "https://dav.example/addressbooks/shared/",
+            "initial_access": {"user_id": "user-a", "permission": "read_write"},
+        }
+    )
+    created = client.post("/v1/tenant/accounts", headers=tenant_admin, json=payload)
+    assert created.status_code == 201, created.text
+    account_ref = created.json()["account_ref"]
+    grant_url = f"/v1/tenant/accounts/{account_ref}/grants"
+    for user_id, permission in (("user-b", "read_write"), ("user-c", "read")):
+        response = client.put(
+            grant_url,
+            headers=tenant_admin,
+            json={"user_id": user_id, "permission": permission, "enabled": True},
+        )
+        assert response.status_code == 200
+
+    def user_headers(user_id: str) -> dict[str, str]:
+        return _headers(
+            private_pem,
+            user_id=user_id,
+            scopes="dav:contacts:read dav:contacts:write",
+        )
+
+    user_a = user_headers("user-a")
+    user_b = user_headers("user-b")
+    user_c = user_headers("user-c")
+    for headers in (user_a, user_b, user_c):
+        accounts = _contacts_mcp(
+            client,
+            headers,
+            "tools/call",
+            {"name": "contact_accounts_list", "arguments": {}},
+        )["result"]
+        assert account_ref in {
+            account["account_ref"] for account in accounts["structuredContent"]["accounts"]
+        }
+        assert "Shared tenant contacts" not in str(accounts["structuredContent"])
+
+    def contact_ref(headers: dict[str, str]) -> str:
+        result = _contacts_mcp(
+            client,
+            headers,
+            "tools/call",
+            {
+                "name": "contacts_list",
+                "arguments": {"account_ref": account_ref},
+            },
+        )["result"]
+        contacts = result["structuredContent"]["contacts"]
+        assert len(contacts) == 1
+        return contacts[0]["contact_ref"]
+
+    contact_a = contact_ref(user_a)
+    contact_b = contact_ref(user_b)
+    contact_c = contact_ref(user_c)
+    assert len({contact_a, contact_b, contact_c}) == 3
+
+    cross_caller = _contacts_mcp(
+        client,
+        user_b,
+        "tools/call",
+        {
+            "name": "contacts_get",
+            "arguments": {"contact_ref": contact_a, "fields": ["emails"]},
+        },
+    )
+    assert cross_caller["error"]["code"] == -32001
+
+    read_only_write = _contacts_mcp(
+        client,
+        user_c,
+        "tools/call",
+        {
+            "name": "contacts_create",
+            "arguments": {"account_ref": account_ref, "name": "Denied contact"},
+        },
+    )
+    assert read_only_write["error"]["code"] == -32001
+    allowed_write = _contacts_mcp(
+        client,
+        user_b,
+        "tools/call",
+        {
+            "name": "contacts_create",
+            "arguments": {"account_ref": account_ref, "name": "Allowed contact"},
+        },
+    )
+    assert allowed_write["result"]["structuredContent"]["status"] == "created"
+
+    ungranted_admin = user_headers("admin-no-contact-access")
+    denied_admin = _contacts_mcp(
+        client,
+        ungranted_admin,
+        "tools/call",
+        {
+            "name": "contacts_list",
+            "arguments": {"account_ref": account_ref},
+        },
+    )
+    assert denied_admin["error"]["code"] == -32001
+
+    assert client.delete(f"{grant_url}/user-b", headers=tenant_admin).status_code == 204
+    revoked = _contacts_mcp(
+        client,
+        user_b,
+        "tools/call",
+        {
+            "name": "contacts_get",
+            "arguments": {"contact_ref": contact_b, "fields": ["emails"]},
+        },
+    )
+    assert revoked["error"]["code"] == -32001
+
+    renamed = client.patch(
+        f"/v1/tenant/accounts/{account_ref}",
+        headers=tenant_admin,
+        json={"label": "Updated tenant contacts"},
+    )
+    assert renamed.status_code == 200
+    stale = _contacts_mcp(
+        client,
+        user_a,
+        "tools/call",
+        {
+            "name": "contacts_get",
+            "arguments": {"contact_ref": contact_a, "fields": ["emails"]},
+        },
+    )
+    assert stale["error"]["code"] == -32001
+    current_contact = contact_ref(user_a)
+
+    disabled = client.patch(
+        f"/v1/tenant/accounts/{account_ref}",
+        headers=tenant_admin,
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200
+    disabled_accounts = _contacts_mcp(
+        client,
+        user_a,
+        "tools/call",
+        {"name": "contact_accounts_list", "arguments": {}},
+    )["result"]
+    assert account_ref not in {
+        account["account_ref"] for account in disabled_accounts["structuredContent"]["accounts"]
+    }
+    disabled_ref = _contacts_mcp(
+        client,
+        user_a,
+        "tools/call",
+        {
+            "name": "contacts_get",
+            "arguments": {"contact_ref": current_contact, "fields": ["emails"]},
+        },
+    )
+    assert disabled_ref["error"]["code"] == -32001
+    assert (
+        client.delete(f"/v1/tenant/accounts/{account_ref}", headers=tenant_admin).status_code == 204
+    )
+
+
 def test_resource_grants_support_tenant_and_user_permissions(tmp_path: Path) -> None:
     store = AccountStore(
         tmp_path / "grants.db",
@@ -1862,6 +2062,143 @@ def test_static_carddav_account_is_authenticated_and_owner_scoped() -> None:
     with pytest.raises(MCPToolCallFailure) as exc_info:
         broker.call_tool(owner, "contacts_create", {"name": "New Person"})
     assert exc_info.value.code == -32001
+
+
+def test_contact_protection_treats_names_across_accounts_as_one_namespace(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(
+        tmp_path / "contact-protection.db",
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    store.create_account(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        kind="carddav",
+        label="Managed contacts",
+        base_url="https://dav.example/addressbooks/managed/",
+        credential=PasswordCredential(username="managed", password="secret", mode="basic"),
+        enabled=True,
+        status="ready",
+        last_error=None,
+        idempotency_key=None,
+        request_hash=None,
+    )
+    static_template = StaticContactAccount(
+        account_id="static-contacts",
+        addressbook_url="https://dav.example/addressbooks/static/",
+        username="static",
+        password="secret",
+        tenant_id="tenant-a",
+        user_id="user-a",
+    )
+    broker = GatewayContactsMCP(
+        static_template,
+        store=store,
+        server_factory=lambda _account: PrivateContactsMCPServer(contacts=[Contact("SameEntry")]),
+        account_server_factory=lambda _account: PrivateContactsMCPServer(
+            contacts=[Contact("SameEntry")]
+        ),
+    )
+    identity = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        scopes=frozenset({"dav:contacts:read"}),
+        token_id="token-a",
+    )
+
+    result = broker.call_tool(identity, "contacts_protect_text", {"text": "Email Alex Smith today"})
+    assert result["structuredContent"] == {
+        "text": "Email Alex Smith today",
+        "protected_contact_count": 0,
+    }
+    assert result["_meta"][PRIVATE_VALUES_META_KEY] == {}
+
+    class FailingContactSource(StaticContactSource):
+        def list_contact_resources(self, *, limit: int) -> tuple[list[ContactResource], bool]:
+            raise RuntimeError("provider unavailable")
+
+    fail_closed = GatewayContactsMCP(
+        static_template,
+        store=store,
+        server_factory=lambda _account: PrivateContactsMCPServer(contacts=[Contact("UniqueEntry")]),
+        account_server_factory=lambda _account: PrivateContactsMCPServer(
+            contact_source=FailingContactSource()
+        ),
+    )
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        fail_closed.call_tool(
+            identity, "contacts_protect_text", {"text": "Email UniqueEntry today"}
+        )
+    assert exc_info.value.code == -32002
+
+
+def test_managed_carddav_references_are_caller_bound_across_instances(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = AccountStore(
+        tmp_path / "managed-carddav.db",
+        cipher=AccountCipher(keyring={1: b"k" * 32}, active_version=1),
+    )
+    account, _created = store.create_tenant_account(
+        tenant_id="tenant-a",
+        actor_user_id="admin-a",
+        kind="carddav",
+        label="Shared durable contacts",
+        base_url="https://dav.example/addressbooks/shared/",
+        credential=PasswordCredential(username="shared", password="secret", mode="basic"),
+        enabled=True,
+        status="ready",
+        last_error=None,
+        idempotency_key=None,
+        request_hash=None,
+        initial_access=("user-a", "read_write"),
+    )
+    store.upsert_account_grant(
+        account_ref=account.account_ref,
+        tenant_id="tenant-a",
+        user_id="user-b",
+        permission="read_write",
+        enabled=True,
+        updated_by="admin-a",
+    )
+    monkeypatch.setattr(
+        "private_dav_mcp.gateway_contacts.CardDAVContactSource",
+        lambda **_kwargs: StaticContactSource(
+            contacts=[Contact("Shared Person", emails=("contact-value",))]
+        ),
+    )
+    user_a = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        scopes=frozenset({"dav:contacts:read", "dav:contacts:write"}),
+        token_id="token-a",
+    )
+    user_b = GatewayIdentity(
+        tenant_id="tenant-a",
+        user_id="user-b",
+        scopes=frozenset({"dav:contacts:read", "dav:contacts:write"}),
+        token_id="token-b",
+    )
+    gateway_a = GatewayContactsMCP(None, store=store)
+    gateway_b = GatewayContactsMCP(None, store=store)
+
+    listed = gateway_a.call_tool(user_a, "contacts_list", {"account_ref": account.account_ref})
+    contact_ref = listed["structuredContent"]["contacts"][0]["contact_ref"]
+    selected = gateway_b.call_tool(
+        user_a, "contacts_get", {"contact_ref": contact_ref, "fields": ["emails"]}
+    )
+    assert len(selected["structuredContent"]["emails"]) == 1
+
+    with pytest.raises(MCPToolCallFailure) as exc_info:
+        gateway_b.call_tool(
+            user_b,
+            "contacts_get",
+            {"contact_ref": contact_ref, "fields": ["emails"]},
+        )
+    assert exc_info.value.code == -32001
+    assert store.list_references("tenant-a", "user-a", account.account_ref)
+    assert store.list_references("tenant-a", "user-b", account.account_ref) == []
 
 
 def test_shared_account_durable_references_are_caller_bound_across_instances(
