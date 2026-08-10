@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -286,6 +286,86 @@ class AccountStore:
         with self._connect() as connection:
             return self._get_account(connection, tenant_id, user_id, account_ref)
 
+    def get_account_for_tenant(self, tenant_id: str, account_ref: str) -> GatewayAccount | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM dav_accounts
+                WHERE tenant_id = ? AND account_ref = ?
+                """,
+                (tenant_id, account_ref),
+            ).fetchone()
+        return self._decode_account(row) if row is not None else None
+
+    def list_accounts_for_subject(
+        self,
+        tenant_id: str,
+        user_id: str,
+        *,
+        permission: Literal["read", "write"],
+        limit: int,
+    ) -> list[GatewayAccount]:
+        if permission not in {"read", "write"}:
+            raise ValueError("Account permission must be read or write")
+        if limit < 1:
+            raise ValueError("Account access limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT account.* FROM dav_accounts AS account
+                WHERE account.tenant_id = ?
+                  AND account.enabled = 1
+                  AND (
+                    (
+                      account.owner_type = 'user'
+                      AND account.owner_user_id = ?
+                    )
+                    OR (
+                      account.owner_type = 'tenant'
+                      AND EXISTS (
+                        SELECT 1 FROM dav_account_grants AS account_grant
+                        WHERE account_grant.account_ref = account.account_ref
+                          AND account_grant.tenant_id = account.tenant_id
+                          AND account_grant.user_id IN (?, '*')
+                          AND account_grant.enabled = 1
+                          AND (? = 'read' OR account_grant.permission = 'read_write')
+                      )
+                    )
+                  )
+                ORDER BY account.created_at, account.account_ref
+                LIMIT ?
+                """,
+                (tenant_id, user_id, user_id, permission, limit),
+            ).fetchall()
+        return [self._decode_account(row) for row in rows]
+
+    def account_grant_access(
+        self, account_ref: str, tenant_id: str, user_id: str
+    ) -> tuple[Literal["read", "read_write"], Literal["exact_grant", "tenant_grant"]] | None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT user_id, permission FROM dav_account_grants
+                WHERE account_ref = ? AND tenant_id = ?
+                  AND user_id IN (?, '*') AND enabled = 1
+                """,
+                (account_ref, tenant_id, user_id),
+            ).fetchall()
+        if not rows:
+            return None
+        permission: Literal["read", "read_write"] = (
+            "read_write" if any(str(row["permission"]) == "read_write" for row in rows) else "read"
+        )
+        source: Literal["exact_grant", "tenant_grant"] = (
+            "exact_grant"
+            if any(
+                str(row["user_id"]) == user_id and str(row["permission"]) == permission
+                for row in rows
+            )
+            else "tenant_grant"
+        )
+        return permission, source
+
     def update_account(self, account: GatewayAccount, *, audit_operation: str) -> GatewayAccount:
         updated = replace(account, updated_at=_utc_now())
         encrypted = self._encrypt_account(updated)
@@ -359,7 +439,7 @@ class AccountStore:
             (
                 account.account_ref,
                 account.tenant_id,
-                account.user_id,
+                account.owner_user_id or "",
                 account.owner_type,
                 account.owner_user_id,
                 encrypted["aad_version"],
