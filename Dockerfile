@@ -23,9 +23,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN rm -rf \
     /usr/local/bin/pip* \
-    /usr/local/lib/python3.11/site-packages/pip* \
-    /usr/local/lib/python3.11/site-packages/setuptools* \
-    /usr/local/lib/python3.11/site-packages/wheel* \
+    /usr/local/lib/python*/site-packages/pip* \
+    /usr/local/lib/python*/site-packages/setuptools* \
+    /usr/local/lib/python*/site-packages/wheel* \
     && groupadd --system app \
     && useradd --system --gid app --create-home app
 
