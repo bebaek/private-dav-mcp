@@ -151,7 +151,7 @@ def test_v4_account_migration_backfills_ownership_without_reencrypting(tmp_path:
             """
         ).fetchone()
         assert row == ("user", "user-a", 1, original_wrapped_dek)
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
         tables = {
             item[0]
             for item in connection.execute(
@@ -210,6 +210,61 @@ def test_new_account_ciphertext_is_bound_to_explicit_ownership(tmp_path: Path) -
 
     with pytest.raises(InvalidTag):
         store.get_account("tenant-a", "user-a", account.account_ref)
+
+
+def test_calendar_preferences_are_encrypted_stable_and_cascaded(tmp_path: Path) -> None:
+    database = tmp_path / "calendar-preferences.db"
+    store = AccountStore(database, cipher=_cipher())
+    account, _created = store.create_account(
+        tenant_id="tenant-a",
+        user_id="user-a",
+        kind="caldav",
+        label="Personal",
+        base_url="https://dav.example/calendars/",
+        credential=PasswordCredential(username="user", password="secret", mode="basic"),
+        enabled=True,
+        status="ready",
+        last_error=None,
+        idempotency_key=None,
+        request_hash=None,
+    )
+    discovered = [
+        ("https://dav.example/calendars/personal/", "Private Calendar", "#3366cc", False),
+        ("https://dav.example/calendars/work/", "Work Calendar", None, False),
+    ]
+
+    first = store.sync_calendar_preferences(account, discovered)
+    assert len(first) == 2
+    personal_ref = {item.href: item for item in first}[discovered[0][0]].calendar_ref
+    disabled = store.set_calendar_enabled(
+        "tenant-a",
+        account.account_ref,
+        personal_ref,
+        enabled=False,
+        actor_user_id="user-a",
+        audit_operation="calendar.preference_update",
+    )
+    assert disabled is not None and disabled.enabled is False
+    repeated = store.sync_calendar_preferences(account, list(reversed(discovered)))
+    by_href = {item.href: item for item in repeated}
+    assert by_href[discovered[0][0]].calendar_ref == personal_ref
+    assert by_href[discovered[0][0]].enabled is False
+    assert b"Private Calendar" not in database.read_bytes()
+    assert b"https://dav.example/calendars/personal/" not in database.read_bytes()
+
+    reduced = store.sync_calendar_preferences(account, [discovered[0]])
+    assert len(reduced) == 1
+    rotating = AccountStore(
+        database,
+        cipher=AccountCipher(keyring={1: b"k" * 32, 2: b"n" * 32}, active_version=2),
+    )
+    assert rotating.rotate_references_to_active_key() == 1
+    assert (
+        rotating.list_calendar_preferences("tenant-a", account.account_ref)[0].href
+        == discovered[0][0]
+    )
+    assert rotating.delete_account("tenant-a", "user-a", account.account_ref) is True
+    assert rotating.list_calendar_preferences("tenant-a", account.account_ref) == []
 
 
 def test_tenant_account_lifecycle_is_idempotent_atomic_and_audited(tmp_path: Path) -> None:

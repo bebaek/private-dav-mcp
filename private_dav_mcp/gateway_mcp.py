@@ -380,8 +380,23 @@ class GatewayCalendarMCP:
                 account_server = self._server_for(identity, account)
                 result = self._delegate(account_server.server, "calendars_list", {})
                 self._merge_private_values(private_values, result)
+                preferences = {
+                    preference.href: preference.enabled
+                    for preference in self._store.list_calendar_preferences(
+                        account.tenant_id, account.account_ref
+                    )
+                }
                 for calendar in result["structuredContent"]["calendars"]:
                     calendar_copy = dict(calendar)
+                    reference = calendar_copy.get("calendar_ref")
+                    resolved = (
+                        account_server.server.trusted_reference(reference)
+                        if isinstance(reference, str)
+                        else None
+                    )
+                    if isinstance(resolved, Calendar) and not preferences.get(resolved.href, True):
+                        _drop_private_placeholder(private_values, calendar_copy.get("name"))
+                        continue
                     calendar_copy["account_ref"] = account.account_ref
                     calendars.append(calendar_copy)
                     self._record_route(
@@ -580,7 +595,25 @@ class GatewayCalendarMCP:
         )
         if account.updated_at != route.account_updated_at:
             raise PermissionError("Unknown or expired reference")
-        return account, self._server_for(identity, account)
+        account_server = self._server_for(identity, account)
+        resolved = account_server.server.trusted_reference(reference)
+        calendar_href = (
+            resolved.href
+            if isinstance(resolved, Calendar)
+            else resolved.calendar_href
+            if isinstance(resolved, EventResource)
+            else None
+        )
+        if calendar_href is not None:
+            preferences = {
+                preference.href: preference.enabled
+                for preference in self._store.list_calendar_preferences(
+                    account.tenant_id, account.account_ref
+                )
+            }
+            if not preferences.get(calendar_href, True):
+                raise PermissionError("Unknown or expired reference")
+        return account, account_server
 
     def _record_event_references(
         self, identity: GatewayIdentity, account: GatewayAccount, result: dict[str, Any]
@@ -742,6 +775,13 @@ def _decode_calendar_reference(
         ),
         expires_at,
     )
+
+
+def _drop_private_placeholder(values: dict[str, str], placeholder: Any) -> None:
+    if not isinstance(placeholder, str) or not placeholder.startswith("{{pii:calendar:"):
+        return
+    if placeholder.endswith("}}"):
+        values.pop(placeholder[len("{{pii:calendar:") : -2], None)
 
 
 def _private_result(

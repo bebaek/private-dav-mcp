@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
 from uvicorn.config import LOGGING_CONFIG
 
-from private_dav_mcp.caldav import CalDAVCalendarSource
+from private_dav_mcp.caldav import CalDAVCalendarSource, Calendar
 from private_dav_mcp.carddav import CardDAVContactSource
 from private_dav_mcp.gateway_access import AccountAccessPolicy
 from private_dav_mcp.gateway_contacts import GatewayContactsMCP, StaticContactAccount
@@ -36,6 +36,7 @@ from private_dav_mcp.gateway_mcp import (
 from private_dav_mcp.gateway_store import (
     AccountCipher,
     AccountStore,
+    CalendarPreference,
     GatewayAccount,
     PasswordCredential,
 )
@@ -123,17 +124,22 @@ class AccountConnectionError(RuntimeError):
 class AccountConnector(Protocol):
     def test(self, account: GatewayAccount) -> int: ...
 
+    def discover_calendars(self, account: GatewayAccount) -> list[Calendar]: ...
+
 
 class CalDAVAccountConnector:
-    def test(self, account: GatewayAccount) -> int:
+    @staticmethod
+    def _source(account: GatewayAccount) -> CalDAVCalendarSource:
+        return CalDAVCalendarSource(
+            calendar_url=account.base_url,
+            username=account.credential.username,
+            password=account.credential.password,
+            auth_mode=account.credential.mode,
+        )
+
+    def discover_calendars(self, account: GatewayAccount) -> list[Calendar]:
         try:
-            source = CalDAVCalendarSource(
-                calendar_url=account.base_url,
-                username=account.credential.username,
-                password=account.credential.password,
-                auth_mode=account.credential.mode,
-            )
-            return len(source.list_calendars())
+            return self._source(account).list_calendars()
         except RuntimeError as exc:
             message = str(exc).lower()
             code = (
@@ -143,8 +149,16 @@ class CalDAVAccountConnector:
             )
             raise AccountConnectionError(code) from exc
 
+    def test(self, account: GatewayAccount) -> int:
+        return len(self.discover_calendars(account))
+
 
 class DAVAccountConnector:
+    def discover_calendars(self, account: GatewayAccount) -> list[Calendar]:
+        if account.kind != "caldav":
+            raise AccountConnectionError("unsupported_account_kind")
+        return CalDAVAccountConnector().discover_calendars(account)
+
     def test(self, account: GatewayAccount) -> int:
         if account.kind == "caldav":
             return CalDAVAccountConnector().test(account)
@@ -256,6 +270,12 @@ class InitialAccountAccessInput(BaseModel):
 
 class TenantAccountCreateInput(AccountCreateInput):
     initial_access: InitialAccountAccessInput | None = None
+
+
+class CalendarPreferencePatchInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
 
 
 class AccountPatchInput(BaseModel):
@@ -941,6 +961,39 @@ def create_gateway_app(
         account = await _tenant_owned_account(account_access_policy, identity, account_ref)
         return _account_response(account)
 
+    @app.get("/v1/tenant/accounts/{account_ref}/calendars")
+    async def list_tenant_account_calendars(
+        account_ref: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, TENANT_ACCOUNTS_READ_SCOPE)
+        account = await _tenant_owned_account(account_access_policy, identity, account_ref)
+        preferences = await _discover_calendar_preferences(connector, store, account)
+        return {"calendars": [_calendar_preference_response(item) for item in preferences]}
+
+    @app.patch("/v1/tenant/accounts/{account_ref}/calendars/{calendar_ref}")
+    async def patch_tenant_account_calendar(
+        account_ref: str,
+        calendar_ref: str,
+        payload: CalendarPreferencePatchInput,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, TENANT_ACCOUNTS_WRITE_SCOPE)
+        account = await _tenant_owned_account(account_access_policy, identity, account_ref)
+        _require_caldav_account(account)
+        preference = await run_in_threadpool(
+            store.set_calendar_enabled,
+            identity.tenant_id,
+            account_ref,
+            calendar_ref,
+            enabled=payload.enabled,
+            actor_user_id=identity.user_id,
+            audit_operation="tenant_calendar.preference_update",
+        )
+        if preference is None:
+            raise GatewayAPIError(404, "not_found", "Calendar was not found.")
+        return _calendar_preference_response(preference)
+
     @app.patch("/v1/tenant/accounts/{account_ref}")
     async def patch_tenant_account(
         account_ref: str,
@@ -976,6 +1029,9 @@ def create_gateway_app(
                 candidate,
                 actor_user_id=identity.user_id,
                 audit_operation="tenant_account.update",
+                clear_calendar_preferences=(
+                    payload.base_url is not None or payload.auth is not None
+                ),
             )
         except LookupError as exc:
             raise GatewayAPIError(404, "not_found", "Account was not found.") from exc
@@ -1189,6 +1245,39 @@ def create_gateway_app(
         account = await _owned_account(account_access_policy, identity, account_ref)
         return _account_response(account)
 
+    @app.get("/v1/accounts/{account_ref}/calendars")
+    async def list_account_calendars(
+        account_ref: str,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, ACCOUNTS_READ_SCOPE)
+        account = await _owned_account(account_access_policy, identity, account_ref)
+        preferences = await _discover_calendar_preferences(connector, store, account)
+        return {"calendars": [_calendar_preference_response(item) for item in preferences]}
+
+    @app.patch("/v1/accounts/{account_ref}/calendars/{calendar_ref}")
+    async def patch_account_calendar(
+        account_ref: str,
+        calendar_ref: str,
+        payload: CalendarPreferencePatchInput,
+        identity: GatewayIdentity = Depends(authenticate),  # noqa: B008
+    ) -> dict[str, Any]:
+        require_scope(identity, ACCOUNTS_WRITE_SCOPE)
+        account = await _owned_account(account_access_policy, identity, account_ref)
+        _require_caldav_account(account)
+        preference = await run_in_threadpool(
+            store.set_calendar_enabled,
+            identity.tenant_id,
+            account_ref,
+            calendar_ref,
+            enabled=payload.enabled,
+            actor_user_id=identity.user_id,
+            audit_operation="calendar.preference_update",
+        )
+        if preference is None:
+            raise GatewayAPIError(404, "not_found", "Calendar was not found.")
+        return _calendar_preference_response(preference)
+
     @app.patch("/v1/accounts/{account_ref}")
     async def patch_account(
         account_ref: str,
@@ -1219,7 +1308,10 @@ def create_gateway_app(
             await _test_account(connector, candidate)
             candidate = replace(candidate, last_checked_at=_now())
         updated = await run_in_threadpool(
-            store.update_account, candidate, audit_operation="account.update"
+            store.update_account,
+            candidate,
+            audit_operation="account.update",
+            clear_calendar_preferences=(payload.base_url is not None or payload.auth is not None),
         )
         return _account_response(updated)
 
@@ -1373,6 +1465,38 @@ def _candidate_account(
         created_at=now,
         updated_at=now,
     )
+
+
+async def _discover_calendar_preferences(
+    connector: AccountConnector, store: AccountStore, account: GatewayAccount
+) -> list[CalendarPreference]:
+    _require_caldav_account(account)
+    try:
+        calendars = await run_in_threadpool(connector.discover_calendars, account)
+    except AccountConnectionError as exc:
+        raise GatewayAPIError(422, exc.code, "Calendar discovery failed.") from exc
+    except Exception as exc:
+        raise GatewayAPIError(422, "connection_failed", "Calendar discovery failed.") from exc
+    return await run_in_threadpool(
+        store.sync_calendar_preferences,
+        account,
+        [(calendar.href, calendar.name, calendar.color, False) for calendar in calendars],
+    )
+
+
+def _require_caldav_account(account: GatewayAccount) -> None:
+    if account.kind != "caldav":
+        raise GatewayAPIError(404, "not_found", "CalDAV account was not found.")
+
+
+def _calendar_preference_response(preference: CalendarPreference) -> dict[str, Any]:
+    return {
+        "calendar_ref": preference.calendar_ref,
+        "name": preference.name,
+        "color": preference.color,
+        "enabled": preference.enabled,
+        "read_only": preference.read_only,
+    }
 
 
 def _collection_count(kind: str, count: int) -> dict[str, int]:
