@@ -21,11 +21,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PRIVATE_DAV_GATEWAY_LOG_FORMAT=json \
     PATH="/app/.venv/bin:${PATH}"
 
-RUN rm -rf \
-    /usr/local/bin/pip* \
-    /usr/local/lib/python*/site-packages/pip* \
-    /usr/local/lib/python*/site-packages/setuptools* \
-    /usr/local/lib/python*/site-packages/wheel* \
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -rf \
+        /usr/local/bin/pip* \
+        /usr/local/lib/python*/site-packages/pip* \
+        /usr/local/lib/python*/site-packages/setuptools* \
+        /usr/local/lib/python*/site-packages/wheel* \
     && groupadd --system app \
     && useradd --system --gid app --create-home app
 
