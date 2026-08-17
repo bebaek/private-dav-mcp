@@ -21,6 +21,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PRIVATE_DAV_GATEWAY_LOG_FORMAT=json \
     PATH="/app/.venv/bin:${PATH}"
 
+# TODO(CVE-2026-53615): Remove this mutable upgrade once the pinned Python base includes util-linux >= 2.41.5-0+deb13u1.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes \
     && rm -rf /var/lib/apt/lists/* \
