@@ -11,7 +11,7 @@ dependencies = [
   "mcp>=2,<3",
   "pyjwt[crypto]>=2.13.0,<3",
   "recurring-ical-events>=3.8,<4",
-  "uvicorn>=0.52.1,<1.0",
+  "uvicorn>=0.52.3,<1.0",
 ]
 
 [project.scripts]
@@ -21,13 +21,13 @@ private-dav-caldav-mcp = "private_dav_mcp.caldav:main"
 
 [dependency-groups]
 dev = [
-  "basedpyright>=1.20.0",
+  "basedpyright>=1.39.10",
   "pytest>=9.1.1,<10.0",
-  "ruff>=0.11,<1.0",
+  "ruff>=0.16.3,<1.0",
 ]
 
 [build-system]
-requires = ["setuptools>=83.0.0", "wheel"]
+requires = ["setuptools>=84.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
